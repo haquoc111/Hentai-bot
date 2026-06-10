@@ -10,10 +10,9 @@ const path                 = require("path");
 
 // ─── CONFIG ────────────────────────────────────────────────────────────────────
 const BOT_TOKEN = process.env.BOT_TOKEN || "8640872279:AAHmCc9ezSBMjJNA7HEMLmeuWvXb7aRrues";
-const ADMIN_ID  = 7680266707;
+const ADMIN_ID  = 7680266707;   // Chỉ admin này mới dùng được /taokey
 const ADMIN_TG  = "@cskh09099";
 const API_URL   = "https://wtxmd52.tele68.com/v1/txmd5/lite-sessions?cp=R&cl=R&pf=web&at=fa2eaf73a676b982e7471927c1e0293b";
-const QR_IMAGE  = path.join(__dirname, "qr_payment.png");
 
 // ─── GÓI KEY ──────────────────────────────────────────────────────────────────
 const PACKAGES = {
@@ -27,8 +26,6 @@ const PACKAGES = {
 // ─── STORAGE (JSON files) ─────────────────────────────────────────────────────
 const DATA_DIR  = path.join(__dirname, "data");
 const KEY_FILE  = path.join(DATA_DIR, "keys.json");
-const USER_FILE = path.join(DATA_DIR, "users.json");
-const PEND_FILE = path.join(DATA_DIR, "pending.json");
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
@@ -57,7 +54,7 @@ function genKey(length = 20) {
 
 function createKey(userId, pkg) {
   let keys    = loadJSON(KEY_FILE);
-  // Xóa key cũ của user nếu có
+  // Xóa key cũ của user nếu có (mỗi user chỉ giữ 1 key)
   keys        = Object.fromEntries(
     Object.entries(keys).filter(([, v]) => v.user_id !== userId)
   );
@@ -95,23 +92,6 @@ function getUserKeyInfo(userId) {
   return null;
 }
 
-// ─── PENDING ORDERS ───────────────────────────────────────────────────────────
-function savePending(userId, pkg) {
-  const pending          = loadJSON(PEND_FILE);
-  pending[String(userId)] = { pkg, time: new Date().toISOString() };
-  saveJSON(PEND_FILE, pending);
-}
-
-function getPending(userId) {
-  return loadJSON(PEND_FILE)[String(userId)] || null;
-}
-
-function removePending(userId) {
-  const pending = loadJSON(PEND_FILE);
-  delete pending[String(userId)];
-  saveJSON(PEND_FILE, pending);
-}
-
 // ─── MD5 PREDICTION ───────────────────────────────────────────────────────────
 function md5Predict(md5Hash) {
   const h = md5Hash.trim().toLowerCase();
@@ -119,16 +99,14 @@ function md5Predict(md5Hash) {
     return { error: "Mã MD5 không hợp lệ (cần 32 ký tự hex)" };
   }
 
-  // Chia thành 4 nhóm 8 ký tự
   const segments = [h.slice(0, 8), h.slice(8, 16), h.slice(16, 24), h.slice(24, 32)];
   const segVals  = segments.map(s => parseInt(s, 16));
   const weights  = [0.40, 0.30, 0.20, 0.10];
   const weighted = segVals.reduce((acc, v, i) => acc + v * weights[i], 0);
   const maxVal   = 0xFFFFFFFF;
 
-  // Parity bit
   const totalBits = BigInt("0x" + h).toString(2).split("").filter(c => c === "1").length;
-  const parity    = totalBits % 2; // 0=chẵn, 1=lẻ
+  const parity    = totalBits % 2;
 
   const entropy = weighted / maxVal;
   const score   = entropy * 0.7 + parity * 0.3;
@@ -230,7 +208,6 @@ async function getApiPrediction() {
   const data = await fetchApiData();
   if (data.error) return { error: data.error };
 
-  // Tìm sessions array
   let sessions = null;
   for (const key of ["data", "sessions", "result", "list", "items"]) {
     if (Array.isArray(data[key])) { sessions = data[key]; break; }
@@ -311,7 +288,7 @@ const backKeyboard = (target = "main_menu") =>
   Markup.inlineKeyboard([[Markup.button.callback("⬅️ Quay lại", target)]]);
 
 // ─── STATE MAP (per-user) ──────────────────────────────────────────────────────
-// "waiting_key" | "waiting_md5" | "waiting_bill" | null
+// "waiting_key" | "waiting_md5" | null
 const userStates = new Map();
 
 // ─── BOT ──────────────────────────────────────────────────────────────────────
@@ -338,17 +315,30 @@ bot.command("cancel", async (ctx) => {
 });
 
 // ─── ADMIN COMMANDS ───────────────────────────────────────────────────────────
-bot.hears(/^\/confirm_(\d+)_(\w+)$/, async (ctx) => {
-  if (ctx.from.id !== ADMIN_ID) return;
-  const userId = parseInt(ctx.match[1]);
-  const pkg    = ctx.match[2];
-
+// Lệnh /taokey <user_id> <pkg> - chỉ admin mới dùng được
+bot.command("taokey", async (ctx) => {
+  if (ctx.from.id !== ADMIN_ID) {
+    await ctx.reply("⛔ Bạn không có quyền sử dụng lệnh này.");
+    return;
+  }
+  const parts = ctx.message.text.trim().split(/\s+/);
+  if (parts.length < 3) {
+    await ctx.reply("⚠️ Cú pháp: /taokey <user_id> <gói>\n\nGói hợp lệ: 5h, 1ngay, 1tuan, 1nam, vinhvien");
+    return;
+  }
+  const userId = parseInt(parts[1]);
+  if (isNaN(userId)) {
+    await ctx.reply("❌ user_id phải là số nguyên.");
+    return;
+  }
+  const pkg = parts[2];
   if (!PACKAGES[pkg]) {
-    return ctx.reply(`❌ Gói '${pkg}' không hợp lệ.`);
+    await ctx.reply(`❌ Gói '${pkg}' không hợp lệ.\nCác gói: ${Object.keys(PACKAGES).join(", ")}`);
+    return;
   }
 
-  const newKey   = createKey(userId, pkg);
-  const info     = PACKAGES[pkg];
+  const newKey = createKey(userId, pkg);
+  const info = PACKAGES[pkg];
   const expireMs = info.hours < 999999
     ? new Date(Date.now() + info.hours * 3600 * 1000)
     : null;
@@ -356,44 +346,32 @@ bot.hears(/^\/confirm_(\d+)_(\w+)$/, async (ctx) => {
     ? expireMs.toLocaleString("vi-VN", { hour12: false })
     : "Vĩnh viễn";
 
-  removePending(userId);
-
+  // Gửi key đến user (nếu bot chưa bị user chặn)
   try {
     await ctx.telegram.sendMessage(
       userId,
-      `🎉 <b>Thanh toán đã được xác nhận!</b>\n\n` +
+      `🎉 <b>Bạn đã được cấp Key thành công!</b>\n\n` +
       `📦 Gói: ${info.label}\n` +
       `🔑 Key của bạn:\n<code>${newKey}</code>\n` +
       `⏰ Hết hạn: ${expireStr}\n\n` +
-      `⚠️ Key chỉ dùng được cho tài khoản này.\n` +
-      `Vào /start và chọn <b>Nhập Key</b> để kích hoạt.`,
+      `👉 Vào /start và chọn <b>Nhập Key</b> để kích hoạt.`,
       { parse_mode: "HTML" }
     );
-  } catch (_) {}
+  } catch (err) {
+    // Nếu không nhắn được cho user, admin vẫn nhận được key
+    await ctx.replyWithHTML(`⚠️ Không thể gửi tin nhắn tới user ${userId}. Key vẫn được tạo.\n\nKey: <code>${newKey}</code>`);
+    return;
+  }
 
   await ctx.replyWithHTML(
     `✅ Đã tạo Key cho user <code>${userId}</code>\n` +
-    `Key: <code>${newKey}</code>\n` +
-    `Gói: ${info.label}`
+    `🔑 Key: <code>${newKey}</code>\n` +
+    `📦 Gói: ${info.label}\n` +
+    `⏰ Hết hạn: ${expireStr}`
   );
 });
 
-bot.hears(/^\/reject_(\d+)$/, async (ctx) => {
-  if (ctx.from.id !== ADMIN_ID) return;
-  const userId = parseInt(ctx.match[1]);
-  removePending(userId);
-  try {
-    await ctx.telegram.sendMessage(
-      userId,
-      `❌ <b>Thanh toán bị từ chối</b>\n\n` +
-      `Bill chuyển khoản của bạn không được xác nhận.\n` +
-      `Vui lòng liên hệ ${ADMIN_TG} để được hỗ trợ.`,
-      { parse_mode: "HTML" }
-    );
-  } catch (_) {}
-  await ctx.reply(`✅ Đã từ chối và thông báo user ${userId}.`);
-});
-
+// Các lệnh admin cũ giữ lại
 bot.command("listkeys", async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return;
   const keys = loadJSON(KEY_FILE);
@@ -440,7 +418,6 @@ bot.command("broadcast", async (ctx) => {
 
 // ─── CALLBACK QUERIES ─────────────────────────────────────────────────────────
 bot.on("callback_query", async (ctx) => {
-  // Bỏ qua lỗi "query is too old" khi Render wake up từ sleep
   try { await ctx.answerCbQuery(); } catch (_) { return; }
   const data   = ctx.callbackQuery.data;
   const userId = ctx.from.id;
@@ -485,16 +462,16 @@ bot.on("callback_query", async (ctx) => {
     return;
   }
 
-  // ── Buy key – show packages
+  // ── Buy key – hiển thị bảng giá và hướng dẫn liên hệ admin
   if (data === "buy_key") {
     const text =
       `💳 <b>Bảng giá Key</b>\n\n` +
-      `1️⃣  1 Ngày          –   <b>20.000đ</b>\n` +
-      `7️⃣  1 Tuần          –   <b>50.000đ</b>\n` +
-      `🔥  1 Năm (SALE)  –   <b>99.000đ</b>\n` +
-      `♾️  Vĩnh Viễn       – <b>150.000đ</b>\n` +
-      `⚡  5 Giờ            –   <b>10.000đ</b>\n\n` +
-      `👇 Chọn gói bạn muốn mua:`;
+      `⚡ 5 Giờ         – 10.000đ\n` +
+      `📅 1 Ngày        – 20.000đ\n` +
+      `📆 1 Tuần        – 50.000đ\n` +
+      `🔥 1 Năm (SALE) – 99.000đ\n` +
+      `♾️ Vĩnh Viễn     – 150.000đ\n\n` +
+      `👇 <b>Chọn gói bên dưới để xem hướng dẫn thanh toán:</b>`;
     try {
       await ctx.editMessageText(text, { parse_mode: "HTML", ...packagesKeyboard() });
     } catch (_) {
@@ -503,51 +480,27 @@ bot.on("callback_query", async (ctx) => {
     return;
   }
 
-  // ── Confirm package purchase
+  // ── Khi chọn một gói cụ thể -> hướng dẫn liên hệ admin
   if (data.startsWith("buy_")) {
     const pkg = data.slice(4);
     if (!PACKAGES[pkg]) return ctx.answerCbQuery("Gói không hợp lệ!", { show_alert: true });
     const info = PACKAGES[pkg];
-    savePending(userId, pkg);
     const text =
-      `💰 <b>Thanh toán gói: ${info.label}</b>\n` +
+      `💰 <b>Gói: ${info.label}</b>\n` +
       `💵 Số tiền: <b>${info.price}</b>\n\n` +
-      `📲 Quét mã QR bên dưới để chuyển khoản.\n` +
-      `Nội dung CK: <code>SXD ${userId}</code>\n\n` +
-      `✅ Sau khi chuyển khoản, gửi <b>bill/ảnh xác nhận</b> cho bot này.\n` +
-      `Admin ${ADMIN_TG} sẽ xác nhận và tạo Key cho bạn.`;
+      `📌 <b>Hướng dẫn mua Key:</b>\n` +
+      `Vui lòng liên hệ trực tiếp Admin ${ADMIN_TG} để được hỗ trợ mua Key.\n\n` +
+      `Sau khi thanh toán, admin sẽ cấp Key và bạn có thể nhập Key bằng nút "🔑 Nhập Key sử dụng".\n\n` +
+      `✅ <b>Lưu ý:</b> Chỉ có admin mới có thể tạo Key. Không gửi bill qua bot.`;
     const kb = Markup.inlineKeyboard([
-      [Markup.button.callback("📤 Gửi bill xác nhận", "send_bill")],
-      [Markup.button.callback("⬅️ Quay lại", "buy_key")],
+      [Markup.button.url("📩 Liên hệ Admin", `https://t.me/${ADMIN_TG.slice(1)}`)],
+      [Markup.button.callback("⬅️ Quay lại bảng giá", "buy_key")],
+      [Markup.button.callback("🏠 Menu chính", "main_menu")],
     ]);
     try {
-      await ctx.replyWithPhoto(
-        { source: fs.createReadStream(QR_IMAGE) },
-        { caption: text, parse_mode: "HTML", ...kb }
-      );
-      await ctx.deleteMessage().catch(() => {});
+      await ctx.editMessageText(text, { parse_mode: "HTML", ...kb });
     } catch (_) {
-      try {
-        await ctx.editMessageText(text + "\n\n⚠️ <i>(Mã QR đang được cập nhật)</i>",
-          { parse_mode: "HTML", ...kb });
-      } catch (__) {
-        await ctx.replyWithHTML(text + "\n\n⚠️ <i>(Mã QR đang được cập nhật)</i>", kb);
-      }
-    }
-    return;
-  }
-
-  // ── Send bill
-  if (data === "send_bill") {
-    userStates.set(userId, "waiting_bill");
-    const caption =
-      `📤 <b>Gửi bill chuyển khoản</b>\n\n` +
-      `Hãy gửi ảnh chụp màn hình hoặc ảnh bill chuyển khoản vào đây.\n` +
-      `Bot sẽ chuyển tiếp đến admin để xác nhận.`;
-    try {
-      await ctx.editMessageCaption(caption, { parse_mode: "HTML", ...backKeyboard("buy_key") });
-    } catch (_) {
-      await ctx.replyWithHTML(caption, backKeyboard("buy_key"));
+      await ctx.replyWithHTML(text, kb);
     }
     return;
   }
@@ -639,7 +592,6 @@ bot.on("callback_query", async (ctx) => {
 
 // ─── TEXT MESSAGES ─────────────────────────────────────────────────────────────
 bot.on(message("text"), async (ctx) => {
-  // Skip commands
   if (ctx.message.text.startsWith("/")) return;
 
   const userId = ctx.from.id;
@@ -656,7 +608,7 @@ bot.on(message("text"), async (ctx) => {
         "❌ Key không hợp lệ hoặc không tồn tại.\nVui lòng kiểm tra lại.",
         backKeyboard()
       );
-      return; // stay in state
+      return;
     }
 
     const [k, v] = entry;
@@ -703,7 +655,7 @@ bot.on(message("text"), async (ctx) => {
     const pred = md5Predict(text);
     if (pred.error) {
       await ctx.replyWithHTML(`❌ ${pred.error}`, backKeyboard("predict_md5"));
-      return; // stay in state
+      return;
     }
 
     const emoji = pred.result.startsWith("TÀI") ? "🔴" : "⚪";
@@ -728,39 +680,8 @@ bot.on(message("text"), async (ctx) => {
   }
 });
 
-// ─── PHOTO MESSAGES ─────────────────────────────────────────────────────────
-bot.on(message("photo"), async (ctx) => {
-  const userId  = ctx.from.id;
-  const state   = userStates.get(userId);
-  const pending = getPending(userId);
-
-  if (state !== "waiting_bill" && !pending) return;
-
-  const user    = ctx.from;
-  const pkgInfo = pending ? PACKAGES[pending.pkg] || {} : {};
-  const caption =
-    `📥 <b>Bill chuyển khoản mới</b>\n\n` +
-    `👤 User: ${user.first_name || ""} (@${user.username || "N/A"})\n` +
-    `🆔 ID: <code>${userId}</code>\n` +
-    `📦 Gói đặt: ${pkgInfo.label || "N/A"} – ${pkgInfo.price || "N/A"}\n\n` +
-    `✅ Xác nhận: /confirm_${userId}_${pending?.pkg || "unknown"}\n` +
-    `❌ Từ chối:  /reject_${userId}`;
-
-  try {
-    await ctx.telegram.sendPhoto(ADMIN_ID, ctx.message.photo.at(-1).file_id, {
-      caption,
-      parse_mode: "HTML",
-    });
-  } catch (_) {}
-
-  userStates.delete(userId);
-  await ctx.replyWithHTML(
-    `✅ <b>Đã gửi bill thành công!</b>\n\n` +
-    `Admin ${ADMIN_TG} sẽ xác nhận và tạo Key cho bạn trong thời gian sớm nhất.\n` +
-    `Vui lòng chờ thông báo.`,
-    mainMenuKeyboard()
-  );
-});
+// ─── LOẠI BỎ HOÀN TOÀN XỬ LÝ ẢNH (BILL) ─────────────────────────────────────────
+// Không còn handler photo nào, vì đã chuyển sang liên hệ admin trực tiếp.
 
 // ─── EXPRESS KEEP-ALIVE ────────────────────────────────────────────────────────
 const app  = express();
@@ -783,7 +704,6 @@ bot.catch((err, ctx) => {
 });
 
 // ─── LAUNCH ───────────────────────────────────────────────────────────────────
-// dropPendingUpdates: bỏ qua toàn bộ tin nhắn/button cũ khi Render wake up
 bot.launch({ dropPendingUpdates: true }).then(() => {
   console.log("🤖 Bot đang chạy...");
 });

@@ -440,7 +440,8 @@ bot.command("broadcast", async (ctx) => {
 
 // ─── CALLBACK QUERIES ─────────────────────────────────────────────────────────
 bot.on("callback_query", async (ctx) => {
-  await ctx.answerCbQuery();
+  // Bỏ qua lỗi "query is too old" khi Render wake up từ sleep
+  try { await ctx.answerCbQuery(); } catch (_) { return; }
   const data   = ctx.callbackQuery.data;
   const userId = ctx.from.id;
 
@@ -768,8 +769,22 @@ const PORT = parseInt(process.env.PORT || "10000", 10);
 app.get("/",       (_, res) => res.json({ status: "online", bot: "SXD Prediction Bot", ping: "pong" }));
 app.get("/health", (_, res) => res.json({ status: "healthy" }));
 
+// ─── GLOBAL ERROR HANDLER – bot không crash vì lỗi lẻ ────────────────────────
+bot.catch((err, ctx) => {
+  const desc = err?.response?.description || err?.message || String(err);
+  const ignore = [
+    "query is too old",
+    "message is not modified",
+    "message to delete not found",
+    "MESSAGE_ID_INVALID",
+  ];
+  if (ignore.some(s => desc.includes(s))) return;
+  console.error("Bot error:", desc);
+});
+
 // ─── LAUNCH ───────────────────────────────────────────────────────────────────
-bot.launch().then(() => {
+// dropPendingUpdates: bỏ qua toàn bộ tin nhắn/button cũ khi Render wake up
+bot.launch({ dropPendingUpdates: true }).then(() => {
   console.log("🤖 Bot đang chạy...");
 });
 

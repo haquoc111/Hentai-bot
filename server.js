@@ -346,56 +346,70 @@ function parseApiResponse(raw) {
 }
 
 // Chuẩn hoá 1 phiên thành { id, diceSum, dice, result, md5 }
+// NGƯỠNG ĐÚNG: 3-10 = XỈU, 11-18 = TÀI
 function normalizeSession(s) {
   if (!s || typeof s !== "object") return null;
 
   // ID phiên
   const id = s.phien || s.id || s.session || s.session_id || s.round || s.issue || s.no || s._id || "N/A";
 
-  // Xúc xắc
+  // ── BƯỚC 1: Tính tổng xúc xắc từ giá trị thực ──────────────────────────────
   let dice = null;
   let diceSum = 0;
+  let hasDice = false;
+
   if (Array.isArray(s.dices) && s.dices.length >= 3) {
-    dice = [Number(s.dices[0]), Number(s.dices[1]), Number(s.dices[2])];
-    diceSum = dice[0] + dice[1] + dice[2];
+    const d = s.dices.slice(0, 3).map(Number);
+    if (d.every(n => n >= 1 && n <= 6)) {
+      dice = d; diceSum = d[0] + d[1] + d[2]; hasDice = true;
+    }
   } else if (Array.isArray(s.dice) && s.dice.length >= 3) {
-    dice = [Number(s.dice[0]), Number(s.dice[1]), Number(s.dice[2])];
-    diceSum = dice[0] + dice[1] + dice[2];
+    const d = s.dice.slice(0, 3).map(Number);
+    if (d.every(n => n >= 1 && n <= 6)) {
+      dice = d; diceSum = d[0] + d[1] + d[2]; hasDice = true;
+    }
   } else if (Array.isArray(s.openCode)) {
-    // Một số API dùng openCode
-    const nums = s.openCode.map(Number).filter(n => n > 0 && n <= 6);
-    if (nums.length >= 3) { dice = nums.slice(0, 3); diceSum = dice[0]+dice[1]+dice[2]; }
+    const nums = s.openCode.map(Number).filter(n => n >= 1 && n <= 6);
+    if (nums.length >= 3) { dice = nums.slice(0, 3); diceSum = dice[0]+dice[1]+dice[2]; hasDice = true; }
   } else if (typeof s.open_code === "string") {
-    const nums = s.open_code.split(",").map(Number).filter(n => n > 0 && n <= 6);
-    if (nums.length >= 3) { dice = nums.slice(0, 3); diceSum = dice[0]+dice[1]+dice[2]; }
+    const nums = s.open_code.split(",").map(Number).filter(n => n >= 1 && n <= 6);
+    if (nums.length >= 3) { dice = nums.slice(0, 3); diceSum = dice[0]+dice[1]+dice[2]; hasDice = true; }
   }
 
-  // Tổng điểm
-  if (diceSum === 0) {
-    diceSum = s.point || s.diceTotal || s.total || s.sum || s.score || 0;
-    diceSum = Number(diceSum);
+  // Fallback: dùng tổng điểm từ field khác (chỉ khi không có dice)
+  if (!hasDice) {
+    const fallbackSum = Number(s.point || s.diceTotal || s.total || s.sum || s.score || 0);
+    if (fallbackSum >= 3 && fallbackSum <= 18) {
+      diceSum = fallbackSum;
+    }
   }
 
-  // Kết quả (TAI/XIU)
+  // ── BƯỚC 2: Xác định kết quả – ƯU TIÊN TÍNH TỪ DICE THỰC TẾ ──────────────
+  // Nếu có dice hoặc tổng hợp lệ (3-18), tính từ tổng → CHÍNH XÁC TUYỆT ĐỐI
+  // KHÔNG dùng result string của API khi có dice (API hay trả sai)
   let result = null;
-  if (typeof s.result === "string") {
-    const r = s.result.toUpperCase();
-    if (r === "TAI" || r === "TÀI" || r === "OVER" || r === "BIG" || r === "T") result = "TAI";
-    else if (r === "XIU" || r === "XỈU" || r === "UNDER" || r === "SMALL" || r === "X") result = "XIU";
-    else if (r === "1") result = "TAI";
-    else if (r === "0") result = "XIU";
-  }
-  if (!result && typeof s.res === "string") {
-    result = s.res.toUpperCase() === "TAI" ? "TAI" : "XIU";
-  }
-  if (!result && diceSum !== 0) {
+
+  if (diceSum >= 3 && diceSum <= 18) {
+    // Luật tài xỉu chuẩn: 11-18 = TÀI, 3-10 = XỈU
     result = diceSum >= 11 ? "TAI" : "XIU";
+  } else {
+    // Chỉ fallback vào result string khi hoàn toàn không có thông tin điểm
+    if (typeof s.result === "string") {
+      const r = s.result.toUpperCase();
+      if (r === "TAI" || r === "TÀI" || r === "OVER" || r === "BIG" || r === "T" || r === "1") result = "TAI";
+      else if (r === "XIU" || r === "XỈU" || r === "UNDER" || r === "SMALL" || r === "X" || r === "0") result = "XIU";
+    }
+    if (!result && typeof s.res === "string") {
+      const r = s.res.toUpperCase();
+      if (r === "TAI" || r === "1") result = "TAI";
+      else result = "XIU";
+    }
   }
 
   // MD5
   const md5 = s.md5 || s.hash || s.verify_hash || s.hashValue || s.verifyHash || null;
 
-  if (!result && !diceSum) return null;
+  if (!result) return null;
 
   return { id: String(id), diceSum, dice, result, md5: md5 ? String(md5).toLowerCase() : null };
 }
@@ -1041,7 +1055,7 @@ bot.on(message("text"), async (ctx) => {
     if (!keyInfo) {
       return ctx.replyWithHTML("❌ <b>Key không hợp lệ.</b>\nVui lòng kiểm tra lại.", backKeyboard());
     }
-    // FIX: so sánh đúng thời hạn
+    // Kiểm tra hết hạn
     if (!isKeyValid(keyInfo)) {
       return ctx.replyWithHTML(
         `⏰ <b>Key đã hết hạn!</b>\n\nKey này đã hết hạn từ ${formatExpire(keyInfo.expire)}.\nVui lòng mua gói mới.`,
@@ -1051,14 +1065,20 @@ bot.on(message("text"), async (ctx) => {
         ])
       );
     }
+    // Kiểm tra key bị dùng bởi người khác
     if (keyInfo.user_id && Number(keyInfo.user_id) !== userId) {
       return ctx.replyWithHTML("🚫 Key đã được dùng bởi tài khoản khác.", backKeyboard());
     }
-    // Gán user_id nếu chưa có
-    if (!keyInfo.user_id) {
-      keyInfo.user_id = userId;
-      await storage.setKey(text, { ...keyInfo, key_text: undefined });
-    }
+    // FIX: Luôn ghi user_id vào key khi kích hoạt
+    // Dù admin đã tạo key sẵn cho userId, vẫn cần setKey để DB flush đúng user_id
+    // Nhờ đó validateKey (getUserKey theo userId) mới tìm được
+    const activateData = {
+      user_id: userId,
+      pkg: keyInfo.pkg,
+      expire: keyInfo.expire,
+      created: keyInfo.created || new Date().toISOString(),
+    };
+    await storage.setKey(text, activateData);
     userStates.delete(userId);
     await ctx.replyWithHTML(
       `✅ <b>Kích hoạt thành công!</b>\n\n` +

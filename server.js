@@ -34,7 +34,8 @@ class KeyStorage {
         user_id TEXT,
         pkg TEXT,
         expire TEXT,
-        created TEXT
+        created TEXT,
+        activated TEXT
       )
     `).catch(() => {});
   }
@@ -50,18 +51,22 @@ class KeyStorage {
   }
 
   async saveAll(keys) {
-    if (this.useDb) return;
+    if (this.useDb) {
+      // For DB mode, we handle individual updates, but this method is kept for compatibility
+      // Not used for bulk save, only for delete
+      return;
+    }
     fs.writeFileSync(this.keyFile, JSON.stringify(keys, null, 2));
   }
 
   async setKey(keyText, data) {
     if (this.useDb) {
       await pool.query(
-        `INSERT INTO keys (key_text, user_id, pkg, expire, created)
-         VALUES ($1,$2,$3,$4,$5)
+        `INSERT INTO keys (key_text, user_id, pkg, expire, created, activated)
+         VALUES ($1,$2,$3,$4,$5,$6)
          ON CONFLICT (key_text)
-         DO UPDATE SET user_id=$2, pkg=$3, expire=$4`,
-        [keyText, String(data.user_id || ""), data.pkg, data.expire, data.created || new Date().toISOString()]
+         DO UPDATE SET user_id=$2, pkg=$3, expire=$4, activated=$6`,
+        [keyText, data.user_id || null, data.pkg, data.expire, data.created || new Date().toISOString(), data.activated || null]
       );
     } else {
       const keys = await this.loadAll();
@@ -83,7 +88,7 @@ class KeyStorage {
 
   async activateKey(keyText, userId) {
     const keys = await this.loadAll();
-    const k = keys[keyText];
+    let k = keys[keyText];
     if (!k) return { ok: false, msg: "❌ Key không tồn tại!" };
     if (k.user_id && String(k.user_id) !== String(userId)) return { ok: false, msg: "❌ Key này đã được dùng bởi người khác!" };
 
@@ -99,20 +104,23 @@ class KeyStorage {
         await pool.query(
           `UPDATE keys SET user_id=$1, expire=$2, activated=$3 WHERE key_text=$4`,
           [String(userId), expire, k.activated, keyText]
-        ).catch(async () => {
-          // fallback nếu cột activated chưa tồn tại
-          await pool.query(
-            `UPDATE keys SET user_id=$1, expire=$2 WHERE key_text=$3`,
-            [String(userId), expire, keyText]
-          );
-        });
+        );
       } else {
         keys[keyText] = k;
         await this.saveAll(keys);
       }
     }
-
     return { ok: true, key: { key_text: keyText, ...k } };
+  }
+
+  async deleteKey(keyText) {
+    if (this.useDb) {
+      await pool.query(`DELETE FROM keys WHERE key_text=$1`, [keyText]);
+    } else {
+      const keys = await this.loadAll();
+      delete keys[keyText];
+      await this.saveAll(keys);
+    }
   }
 }
 const storage = new KeyStorage();
@@ -133,7 +141,7 @@ const PACKAGES = {
 // ─── KEY VALIDATION ──────────────────────────────────────────────────────────
 function isKeyValid(key) {
   if (!key) return false;
-  if (!key.user_id) return false; // Chưa kích hoạt
+  if (!key.user_id) return false;
   if (key.expire === "never") return true;
   const expireMs = new Date(key.expire).getTime();
   return !isNaN(expireMs) && expireMs > Date.now();
@@ -157,9 +165,8 @@ function formatExpire(exp) {
   return new Date(exp).toLocaleString("vi-VN", { timeZone: "Asia/Ho_Chi_Minh" });
 }
 
-// ─── API DATA PARSER (xử lý mọi cấu trúc API phổ biến của LC79) ───────────────
+// ─── API DATA PARSER (tối ưu cho LC79) ───────────────────────────────────────
 function extractListFromResponse(data) {
-  // Thử tất cả cấu trúc API có thể có
   if (Array.isArray(data)) return data;
   if (data && Array.isArray(data.data)) return data.data;
   if (data && Array.isArray(data.result)) return data.result;
@@ -171,7 +178,6 @@ function extractListFromResponse(data) {
 }
 
 function extractDiceFromSession(s) {
-  // Thứ tự ưu tiên các field dice
   if (Array.isArray(s.dices) && s.dices.length >= 3) return s.dices.map(Number);
   if (Array.isArray(s.dice) && s.dice.length >= 3) return s.dice.map(Number);
   if (typeof s.openCode === "string" && s.openCode.includes(",")) {
@@ -215,68 +221,64 @@ function normalizeSession(s) {
   if (!s) return null;
   const idStr = extractSessionId(s);
   if (!idStr) return null;
-
-  // Lấy số phiên để sort
   const numStr = idStr.replace(/\D/g, "");
   const id_num = numStr ? parseInt(numStr) : 0;
 
   const dice = extractDiceFromSession(s);
   const md5 = extractMd5(s);
-
-  // Ưu tiên: tính từ dice → lấy từ field result
   let result = dice.length >= 3 ? resultFromDice(dice) : resultFromField(s);
-
-  // Nếu vẫn chưa có kết quả, bỏ qua phiên này
   if (!result) return null;
-
   const diceSum = dice.length >= 3 ? dice[0] + dice[1] + dice[2] : 0;
 
   return { id: idStr, id_num, diceSum, dice, result, md5 };
 }
 
-// ─── MD5 ANALYSIS ─────────────────────────────────────────────────────────────
-// Phân tích MD5 của phiên tiếp theo (nếu API cung cấp MD5 trước)
+// ─── MD5 SEQUENCE PREDICTION (hash phiên N → kết quả phiên N+1) ───────────────
 function analyzeMd5(md5String) {
   if (!md5String || md5String.length < 32) return null;
   try {
-    // Lấy 8 bytes cuối của MD5 hex để phân tích
     const lastBytes = md5String.slice(-16);
     const num = parseInt(lastBytes.slice(-8), 16);
     if (isNaN(num)) return null;
     const mod = num % 100;
-    // Phân tích tính chất số: lẻ/chẵn, đặc điểm bit
-    const evenOdd = num % 2; // 0=chẵn, 1=lẻ
+    const evenOdd = num % 2;
     const byteSum = lastBytes.split("").reduce((acc, c) => acc + parseInt(c, 16), 0);
     return { num, mod, evenOdd, byteSum };
   } catch { return null; }
 }
 
-// Học pattern MD5 → kết quả từ lịch sử
-function buildMd5Pattern(sessions) {
-  const patterns = [];
-  for (const s of sessions) {
-    if (!s.md5) continue;
-    const analysis = analyzeMd5(s.md5);
-    if (!analysis) continue;
-    patterns.push({ ...analysis, result: s.result });
+// Xây dựng map: (md5 của phiên N) -> (kết quả phiên N+1)
+function buildMd5SequenceMap(sessions) {
+  // sessions đã được sắp xếp giảm dần (mới nhất đầu)
+  // Cần map theo thứ tự thời gian: phiên cũ hơn (chỉ số lớn hơn? thực tế id_num càng lớn càng mới)
+  // Để dễ xử lý, tạo map từ phiên cũ đến phiên mới hơn.
+  // Sắp xếp tăng dần theo id_num (cũ → mới)
+  const sortedAsc = [...sessions].sort((a, b) => a.id_num - b.id_num);
+  const sequence = [];
+  for (let i = 0; i < sortedAsc.length - 1; i++) {
+    const cur = sortedAsc[i];
+    const next = sortedAsc[i+1];
+    if (cur.md5 && next.result) {
+      sequence.push({ md5: cur.md5, nextResult: next.result });
+    }
   }
-  return patterns;
+  return sequence;
 }
 
-function predictFromMd5Pattern(nextMd5, patterns) {
-  if (!nextMd5 || patterns.length < 10) return null;
-  const target = analyzeMd5(nextMd5);
+function predictFromMd5Sequence(currentMd5, sequenceMap) {
+  if (!currentMd5 || sequenceMap.length < 10) return null;
+  const target = analyzeMd5(currentMd5);
   if (!target) return null;
 
-  // Tìm các phiên có md5 gần giống (cùng đặc điểm)
-  const similar = patterns.filter(p =>
-    Math.abs(p.byteSum - target.byteSum) <= 8 ||
-    p.evenOdd === target.evenOdd
-  );
-
+  // Tìm các bản ghi trong lịch sử có md5 gần giống (cùng đặc điểm)
+  const similar = sequenceMap.filter(item => {
+    const hist = analyzeMd5(item.md5);
+    if (!hist) return false;
+    return (Math.abs(hist.byteSum - target.byteSum) <= 8) || (hist.evenOdd === target.evenOdd);
+  });
   if (similar.length < 5) return null;
 
-  const taiCount = similar.filter(p => p.result === "TAI").length;
+  const taiCount = similar.filter(item => item.nextResult === "TAI").length;
   const xiuCount = similar.length - taiCount;
   const taiRate = (taiCount / similar.length) * 100;
 
@@ -285,16 +287,16 @@ function predictFromMd5Pattern(nextMd5, patterns) {
   return null;
 }
 
-// ─── THUẬT TOÁN DỰ ĐOÁN THÔNG MINH ─────────────────────────────────────────
+// ─── THUẬT TOÁN DỰ ĐOÁN THÔNG MINH (chính xác theo chuỗi thực tế) ────────────
 function analyzeSmart(sessions) {
   if (!sessions || sessions.length < 5) {
-    return { prediction: "TÀI", confidence: 50, reason: "⚠️ Đang thu thập dữ liệu..." };
+    return { prediction: "TAI", confidence: 50, reason: "⚠️ Đang thu thập dữ liệu..." };
   }
 
   const results = sessions.map(s => s.result);
   const n = results.length;
 
-  // ── 1. STREAK (Bệt) ──────────────────────────────────────────────────────
+  // 1. STREAK (bệt) - tính từ phiên mới nhất (sessions[0])
   let streak = 1;
   const lastRes = results[0];
   for (let i = 1; i < n; i++) {
@@ -302,33 +304,31 @@ function analyzeSmart(sessions) {
     else break;
   }
 
-  // ── 2. TỶ LỆ CÂN BẰNG (nhiều phiên hơn = chính xác hơn) ─────────────────
-  const window20 = Math.min(20, n);
-  const taiCount20 = results.slice(0, window20).filter(r => r === "TAI").length;
-  const taiRate20 = (taiCount20 / window20) * 100;
+  // 2. Tỷ lệ Tài/Xỉu trong 20 phiên gần nhất
+  const windowSize = Math.min(20, n);
+  const taiCount20 = results.slice(0, windowSize).filter(r => r === "TAI").length;
+  const taiRate20 = (taiCount20 / windowSize) * 100;
 
-  // ── 3. PHÁT HIỆN CẦU (Pattern Detection) ──────────────────────────────────
-  // Cầu 1-1: T-X-T-X hoặc X-T-X-T
+  // 3. Phát hiện cầu 1-1 (đảo liên tục)
   let pingpong = 0;
-  for (let i = 0; i < Math.min(8, n - 1); i++) {
-    if (results[i] !== results[i + 1]) pingpong++;
-    else { pingpong -= 2; break; }
+  for (let i = 0; i < Math.min(8, n-1); i++) {
+    if (results[i] !== results[i+1]) pingpong++;
+    else { pingpong = -10; break; }
   }
   const isPingPong = pingpong >= 4;
 
-  // Cầu đôi: TT-XX-TT
+  // 4. Phát hiện cầu đôi (TT-XX-TT)
   let doublePair = 0;
-  for (let i = 0; i < Math.min(8, n - 1); i += 2) {
-    if (i + 1 < n && results[i] === results[i + 1]) doublePair++;
+  for (let i = 0; i < Math.min(8, n-1); i+=2) {
+    if (i+1 < n && results[i] === results[i+1]) doublePair++;
     else { doublePair = 0; break; }
   }
   const isDoublePair = doublePair >= 2;
 
-  // ── 4. PHÂN TÍCH MD5 ──────────────────────────────────────────────────────
-  const md5Patterns = buildMd5Pattern(sessions);
-  // Lấy MD5 của phiên mới nhất để dự đoán phiên kế
-  const latestMd5 = sessions[0].md5;
-  const md5Pred = predictFromMd5Pattern(latestMd5, md5Patterns);
+  // 5. Dự đoán MD5 dựa trên chuỗi (hash phiên hiện tại -> kết quả phiên tiếp theo)
+  const md5Sequence = buildMd5SequenceMap(sessions);
+  const currentMd5 = sessions[0].md5; // MD5 của phiên đã mở gần nhất
+  const md5Pred = predictFromMd5Sequence(currentMd5, md5Sequence);
 
   // ── QUYẾT ĐỊNH DỰ ĐOÁN ────────────────────────────────────────────────────
   let prediction = "";
@@ -346,13 +346,13 @@ function analyzeSmart(sessions) {
     confidence = Math.min(88, 76 + streak * 2);
     reason = `🔥 <b>Bẻ Cầu:</b> ${lastRes === "TAI" ? "TÀI" : "XỈU"} bệt ${streak} phiên. Thời điểm vào bẻ cầu.`;
   }
-  // Cầu 1-1 (đảo liên tục)
+  // Cầu đảo 1-1
   else if (isPingPong) {
     prediction = lastRes === "TAI" ? "XIU" : "TAI";
     confidence = 82;
     reason = `🔄 <b>Cầu Đảo 1-1:</b> Nhịp đảo ổn định. Đánh theo nhịp đảo (${lastRes === "TAI" ? "TÀI→XỈU" : "XỈU→TÀI"}).`;
   }
-  // Cầu đôi (TT-XX-TT)
+  // Cầu đôi
   else if (isDoublePair) {
     prediction = lastRes;
     confidence = 80;
@@ -360,7 +360,6 @@ function analyzeSmart(sessions) {
   }
   // Theo cầu ngắn (2-3 phiên)
   else if (streak >= 2) {
-    // Kết hợp với MD5 nếu có
     if (md5Pred && md5Pred.pred === lastRes) {
       prediction = lastRes;
       confidence = Math.round((75 + md5Pred.conf) / 2);
@@ -371,11 +370,11 @@ function analyzeSmart(sessions) {
       reason = `📈 <b>Theo Cầu:</b> Xu hướng ${lastRes === "TAI" ? "TÀI" : "XỈU"} đang hình thành (${streak} phiên).`;
     }
   }
-  // Dựa vào MD5 Pattern
+  // Dựa vào MD5 Pattern (chuỗi)
   else if (md5Pred) {
     prediction = md5Pred.pred;
     confidence = md5Pred.conf;
-    reason = `🔬 <b>Phân tích MD5:</b> ${md5Pred.pred === "TAI" ? "TÀI" : "XỈU"} theo pattern hash (${md5Pred.conf}% từ ${md5Patterns.length} mẫu).`;
+    reason = `🔬 <b>Phân tích MD5 chuỗi:</b> ${md5Pred.pred === "TAI" ? "TÀI" : "XỈU"} theo pattern hash (${md5Pred.conf}% từ ${md5Sequence.length} mẫu).`;
   }
   // Cân bằng tỷ lệ
   else {
@@ -408,13 +407,12 @@ function analyzeSmart(sessions) {
 // ─── BOT HANDLERS ─────────────────────────────────────────────────────────────
 const bot = new Telegraf(BOT_TOKEN);
 
-// /start
 bot.start((ctx) => {
   ctx.replyWithHTML(
-    `🚀 <b>SXD AI PREDICTION v5.0</b>\n\n` +
+    `🚀 <b>SXD AI PREDICTION v6.0</b>\n\n` +
     `✅ Fix chuẩn API LC79 – đọc đúng phiên & kết quả\n` +
-    `✅ Thuật toán MD5 Pattern nâng cao\n` +
-    `✅ Bẻ cầu mạnh / Theo cầu khoẻ\n` +
+    `✅ Thuật toán MD5 theo chuỗi (hash N → kết quả N+1)\n` +
+    `✅ Bẻ cầu mạnh / Theo cầu khoẻ dựa trên dữ liệu thực\n` +
     `✅ Key đếm giờ chuẩn từ lúc kích hoạt\n\n` +
     `Dùng lệnh <code>/key XXXX</code> để kích hoạt key của bạn.`,
     Markup.inlineKeyboard([
@@ -424,7 +422,6 @@ bot.start((ctx) => {
   );
 });
 
-// /key <keyText> — kích hoạt key
 bot.command("key", async (ctx) => {
   const parts = ctx.message.text.trim().split(/\s+/);
   const keyText = parts[1];
@@ -446,10 +443,8 @@ bot.command("key", async (ctx) => {
   );
 });
 
-// DỰ ĐOÁN
 bot.action("predict_api", async (ctx) => {
   const key = await storage.getUserKey(ctx.from.id);
-
   if (!key || !isKeyValid(key)) {
     const expired = key && !isKeyValid(key);
     return ctx.answerCbQuery("⛔ " + (expired ? "Key đã hết hạn!" : "Chưa có key!"), { show_alert: true })
@@ -467,12 +462,11 @@ bot.action("predict_api", async (ctx) => {
 
   try {
     const resp = await axios.get(API_URL, {
-      timeout: 8000,
+      timeout: 10000,
       headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" },
     });
 
     const list = extractListFromResponse(resp.data);
-
     if (list.length === 0) {
       return ctx.reply("❌ Không lấy được dữ liệu từ API. Cấu trúc API có thể đã thay đổi.");
     }
@@ -480,10 +474,9 @@ bot.action("predict_api", async (ctx) => {
     const sessions = list
       .map(normalizeSession)
       .filter(Boolean)
-      .sort((a, b) => b.id_num - a.id_num);
+      .sort((a, b) => b.id_num - a.id_num); // mới nhất đầu
 
     if (sessions.length === 0) {
-      // Debug: in raw để admin xem
       if (ctx.from.id === ADMIN_ID) {
         const sample = JSON.stringify(list.slice(0, 2), null, 2).slice(0, 800);
         return ctx.reply("❌ Không parse được phiên.\nSample API:\n" + sample);
@@ -493,7 +486,6 @@ bot.action("predict_api", async (ctx) => {
 
     const latest = sessions[0];
     const analysis = analyzeSmart(sessions);
-
     const diceStr = latest.dice.length > 0 ? latest.dice.join("-") : "?";
     const nextId = latest.id_num + 1;
     const predLabel = analysis.prediction === "TAI" ? "TÀI 🔴" : "XỈU ⚪";
@@ -526,7 +518,6 @@ bot.action("predict_api", async (ctx) => {
   }
 });
 
-// Thanh xu hướng
 function buildTrendBar(sessions) {
   return sessions
     .slice()
@@ -535,7 +526,6 @@ function buildTrendBar(sessions) {
     .join(" ");
 }
 
-// Menu chính
 bot.action("main_menu", (ctx) => {
   ctx.editMessageText(
     "🏠 <b>Menu Chính</b>",
@@ -549,7 +539,6 @@ bot.action("main_menu", (ctx) => {
   );
 });
 
-// Tài khoản
 bot.action("my_account", async (ctx) => {
   const key = await storage.getUserKey(ctx.from.id);
   if (!key) {
@@ -569,7 +558,6 @@ bot.action("my_account", async (ctx) => {
   );
 });
 
-// Mua key
 bot.action("buy_key", (ctx) => {
   ctx.replyWithHTML(
     `💳 <b>Bảng Giá Key SXD AI</b>\n\n` +
@@ -583,28 +571,22 @@ bot.action("buy_key", (ctx) => {
 });
 
 // ─── ADMIN COMMANDS ──────────────────────────────────────────────────────────
-
-// /taokey <user_id|none> <pkg>  — tạo key mới (chưa gắn user thì user sẽ kích hoạt sau)
 bot.command("taokey", async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return;
   const parts = ctx.message.text.trim().split(/\s+/);
-  const uid = parts[1]; // có thể là "none" hoặc user_id thực
+  const uid = parts[1];
   const pkg = parts[2];
-
   if (!uid || !pkg || !PACKAGES[pkg]) {
     return ctx.reply("Cách dùng: /taokey <user_id|none> <pkg>\nGói: 5h, 1ngay, 1tuan, 1thang, vinhvien\nVí dụ: /taokey none 1ngay");
   }
 
   const keyText = "SXD-" + crypto.randomBytes(8).toString("hex").toUpperCase();
   const isNone = uid === "none";
-
   let expire, user_id;
   if (isNone) {
-    // Key chưa gắn user → thời gian bắt đầu tính khi user /key
     user_id = null;
     expire = "pending_activation";
   } else {
-    // Gắn thẳng vào user → tính thời gian ngay
     user_id = uid;
     const hours = PACKAGES[pkg].hours;
     expire = hours ? new Date(Date.now() + hours * 3600000).toISOString() : "never";
@@ -615,6 +597,7 @@ bot.command("taokey", async (ctx) => {
     pkg,
     expire,
     created: new Date().toISOString(),
+    activated: null,
   });
 
   ctx.replyWithHTML(
@@ -626,13 +609,11 @@ bot.command("taokey", async (ctx) => {
   );
 });
 
-// /listkeys — xem danh sách key
 bot.command("listkeys", async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return;
   const keys = await storage.loadAll();
   const entries = Object.entries(keys);
   if (entries.length === 0) return ctx.reply("Chưa có key nào.");
-
   const lines = entries.slice(-20).map(([k, v]) => {
     const valid = isKeyValid({ ...v, key_text: k });
     return `${valid ? "✅" : "❌"} <code>${k}</code> | ${v.pkg} | ${v.user_id || "chưa kích hoạt"}`;
@@ -640,19 +621,16 @@ bot.command("listkeys", async (ctx) => {
   ctx.replyWithHTML(`📋 <b>Danh sách Key (${entries.length} keys):</b>\n\n` + lines.join("\n"));
 });
 
-// /deletekey <keyText>
 bot.command("deletekey", async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return;
   const keyText = ctx.message.text.trim().split(/\s+/)[1];
   if (!keyText) return ctx.reply("Cách dùng: /deletekey SXD-XXXX");
-  const keys = await storage.loadAll();
-  if (!keys[keyText]) return ctx.reply("❌ Không tìm thấy key.");
-  delete keys[keyText];
-  await storage.saveAll(keys);
+  const key = await storage.getKey(keyText);
+  if (!key) return ctx.reply("❌ Không tìm thấy key.");
+  await storage.deleteKey(keyText);
   ctx.reply(`✅ Đã xoá key: ${keyText}`);
 });
 
-// /debug — xem raw API (admin only)
 bot.command("debug", async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return;
   try {
@@ -670,7 +648,7 @@ app.get("/", (req, res) => res.send("✅ SXD AI Bot đang chạy..."));
 app.listen(process.env.PORT || 3000, () => console.log("Express server started"));
 
 storage.initDb().then(() => {
-  bot.launch().then(() => console.log("✅ Bot SXD AI đã sẵn sàng!"));
+  bot.launch().then(() => console.log("✅ Bot SXD AI v6.0 đã sẵn sàng!"));
 });
 
 process.once("SIGINT", () => bot.stop("SIGINT"));

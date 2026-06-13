@@ -113,7 +113,7 @@ class KeyStorage {
     return keys[keyText] ? { key_text: keyText, ...keys[keyText] } : null;
   }
 
-  // ── FIX: Kích hoạt key – bắt đầu đếm giờ ĐÚNG từ lúc user kích hoạt ────────
+  // ── Kích hoạt key – bắt đầu đếm giờ ĐÚNG từ lúc user kích hoạt ────────────
   async activateKey(keyText, userId) {
     const keys = await this.loadAll();
     let k = keys[keyText];
@@ -121,32 +121,42 @@ class KeyStorage {
     if (k.user_id && String(k.user_id) !== String(userId))
       return { ok: false, msg: "❌ Key này đã được dùng bởi người khác!" };
 
-    // Key chưa gắn user → gắn ngay, bắt đầu đếm giờ từ thời điểm KÍCH HOẠT
     if (!k.user_id) {
+      // Key chưa gắn user → gắn ngay, bắt đầu đếm giờ từ thời điểm KÍCH HOẠT
       const pkg = k.pkg;
       const hours = PACKAGES[pkg] ? PACKAGES[pkg].hours : null;
       const nowIso = new Date().toISOString();
-      // FIX: expire tính từ Date.now() đúng tại lúc kích hoạt
       const expire = hours ? new Date(Date.now() + hours * 3600 * 1000).toISOString() : "never";
       k.user_id = String(userId);
       k.expire = expire;
       k.activated = nowIso;
       if (this.useDb) {
-        await pool.query(
-          `UPDATE keys SET user_id=$1, expire=$2, activated=$3 WHERE key_text=$4`,
-          [String(userId), expire, nowIso, keyText]
-        );
+        try {
+          await pool.query(
+            `UPDATE keys SET user_id=$1, expire=$2, activated=$3 WHERE key_text=$4`,
+            [String(userId), expire, nowIso, keyText]
+          );
+        } catch (e) { console.error("activateKey DB error:", e.message); }
       } else {
         keys[keyText] = k;
         await this.saveAll(keys);
       }
+    } else {
+      // Key đã gắn user_id (tạo bằng /taokey userId pkg) → chỉ đảm bảo memCache đúng
+      k = { ...k, user_id: String(k.user_id) };
     }
+
+    // QUAN TRỌNG: Luôn đồng bộ vào memCache sau mọi trường hợp
+    this.memCache[keyText] = k;
+
     return { ok: true, key: { key_text: keyText, ...k } };
   }
 
   async deleteKey(keyText) {
+    // Luon xoa khoi memCache ngay
+    delete this.memCache[keyText];
     if (this.useDb) {
-      await pool.query(`DELETE FROM keys WHERE key_text=$1`, [keyText]);
+      try { await pool.query(`DELETE FROM keys WHERE key_text=$1`, [keyText]); } catch {}
     } else {
       const keys = await this.loadAll();
       delete keys[keyText];
@@ -666,16 +676,46 @@ function updateWinLoss(userId, newSessionId, newResult) {
 // ─── AUTO PREDICT ─────────────────────────────────────────────────────────────
 async function fetchAndPredict(userId, chatId, messageId, ctx) {
   try {
-    const key = await storage.getUserKey(userId);
-    if (!key || !isKeyValid(key)) {
+    // Ưu tiên đọc thẳng từ memCache để tránh lỗi key không tìm thấy
+    const key = storage.memCache
+      ? Object.entries(storage.memCache).find(([_, v]) => String(v.user_id) === String(userId))
+      : null;
+    const keyObj = key ? { key_text: key[0], ...key[1] } : await storage.getUserKey(userId);
+
+    if (!keyObj || !isKeyValid(keyObj)) {
       stopAutoPredict(userId, chatId);
+      try {
+        await ctx.telegram.editMessageText(chatId, messageId, undefined,
+          "⛔ <b>Key hết hạn hoặc không hợp lệ.</b>\nDùng <code>/key SXD-XXXX</code> để kích hoạt.",
+          { parse_mode: "HTML", ...Markup.inlineKeyboard([[Markup.button.callback("💳 Mua Key", "buy_key")]]) }
+        );
+      } catch {}
       return;
     }
 
-    const resp = await axios.get(API_URL, {
-      timeout: 12000,
-      headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" },
-    });
+    let resp;
+    try {
+      resp = await axios.get(API_URL, {
+        timeout: 15000,
+        headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" },
+      });
+    } catch (apiErr) {
+      console.error("API fetch error:", apiErr.message);
+      // Không xóa message, chờ lần sau retry
+      try {
+        await ctx.telegram.editMessageText(chatId, messageId, undefined,
+          `⏳ <b>Đang tải dữ liệu API...</b>
+🔄 Tự động cập nhật mỗi 20 giây.
+
+⚠️ API đang chậm, đang thử lại...`,
+          { parse_mode: "HTML", ...Markup.inlineKeyboard([
+            [Markup.button.callback("⏹ Dừng tự động", `stop_auto_${userId}`)],
+          ]) }
+        );
+      } catch {}
+      return;
+    }
+
     const list = extractListFromResponse(resp.data);
     if (list.length === 0) return;
 
@@ -696,9 +736,9 @@ async function fetchAndPredict(userId, chatId, messageId, ctx) {
 
     // Lưu dự đoán hiện tại (cho phiên tiếp theo)
     st.lastPrediction = analysis.prediction;
-    st.lastSessionId = String(latest.id_num + 1); // phiên đang chờ kết quả
+    st.lastSessionId = String(latest.id_num + 1);
 
-    const msg = buildPredictMessage(sessions, key, st);
+    const msg = buildPredictMessage(sessions, keyObj, st);
     if (!msg) return;
 
     try {
@@ -733,6 +773,18 @@ function stopAutoPredict(userId, chatId) {
     clearInterval(autoSessions[key].intervalId);
     delete autoSessions[key];
   }
+}
+
+// ─── HELPER: Đọc key ưu tiên memCache ────────────────────────────────────────
+async function getKeyForUser(userId) {
+  // Đọc thẳng từ memCache trước (nhanh & đáng tin cậy nhất)
+  if (storage.memCache) {
+    const entry = Object.entries(storage.memCache)
+      .find(([_, v]) => String(v.user_id) === String(userId));
+    if (entry) return { key_text: entry[0], ...entry[1] };
+  }
+  // Fallback: đọc từ DB / file
+  return await storage.getUserKey(userId);
 }
 
 // ─── BOT HANDLERS ─────────────────────────────────────────────────────────────
@@ -780,7 +832,7 @@ bot.command("key", async (ctx) => {
 // ── DỰ ĐOÁN TỰ ĐỘNG (cập nhật mỗi 20s) ──────────────────────────────────────
 bot.action("predict_auto", async (ctx) => {
   const userId = ctx.from.id;
-  const key = await storage.getUserKey(userId);
+  const key = await getKeyForUser(userId);
   if (!key || !isKeyValid(key)) {
     const expired = key && !isKeyValid(key);
     await ctx.answerCbQuery("⛔ " + (expired ? "Key đã hết hạn!" : "Chưa có key!"), { show_alert: true });
@@ -823,7 +875,7 @@ bot.action(/^stop_auto_(\d+)$/, async (ctx) => {
 // ── DỰ ĐOÁN MD5 ──────────────────────────────────────────────────────────────
 bot.action("predict_md5", async (ctx) => {
   const userId = ctx.from.id;
-  const key = await storage.getUserKey(userId);
+  const key = await getKeyForUser(userId);
   if (!key || !isKeyValid(key)) {
     const expired = key && !isKeyValid(key);
     await ctx.answerCbQuery("⛔ " + (expired ? "Key đã hết hạn!" : "Chưa có key!"), { show_alert: true });
@@ -927,7 +979,7 @@ bot.action("main_menu", async (ctx) => {
 
 bot.action("my_account", async (ctx) => {
   try { await ctx.answerCbQuery(); } catch {}
-  const key = await storage.getUserKey(ctx.from.id);
+  const key = await getKeyForUser(ctx.from.id);
   const st = getStats(ctx.from.id);
   const total = st.win + st.loss;
   const winRate = total > 0 ? ((st.win / total) * 100).toFixed(0) : "—";

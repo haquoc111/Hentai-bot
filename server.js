@@ -177,7 +177,7 @@ class KeyStorage {
 const storage = new KeyStorage();
 
 // ========== CONFIG ==========
-const BOT_TOKEN = process.env.BOT_TOKEN || "8640872279:AAHmCc9ezSBMjJNA7HEMLmeuWvXb7aRrues";
+const BOT_TOKEN = process.env.BOT_TOKEN || "8935408887:AAHujtlfwIw2PZS65ZUFB1LfTwW07AURx2w";
 const ADMIN_ID = 7680266707;
 const API_URL = "https://treo-lc79-h6zy.onrender.com/";
 const API_MD5_URL = "https://treo-lc79-h6zy.onrender.com/";

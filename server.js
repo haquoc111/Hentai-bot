@@ -23,15 +23,17 @@ class KeyStorage {
     this.useDb = !!(pool);
     this.dataDir = path.join(__dirname, "data");
     this.keyFile = path.join(this.dataDir, "keys.json");
-    // In-memory cache – luon hoat dong du khong co DB hay file system bi reset
-    this.memCache = {};
+    this.memCache = {}; // Nguồn dữ liệu chính (Single Source of Truth)
+    
     try { if (!fs.existsSync(this.dataDir)) fs.mkdirSync(this.dataDir, { recursive: true }); } catch {}
-    // Nap file vao cache khi khoi dong (neu co)
-    try {
-      if (!this.useDb && fs.existsSync(this.keyFile)) {
-        this.memCache = JSON.parse(fs.readFileSync(this.keyFile, "utf-8"));
-      }
-    } catch {}
+    
+    // Nạp file vào cache khi khởi động
+    if (!this.useDb && fs.existsSync(this.keyFile)) {
+      try {
+        const fileData = JSON.parse(fs.readFileSync(this.keyFile, "utf-8"));
+        this.memCache = fileData;
+      } catch (e) { console.error("Lỗi đọc keys.json", e); }
+    }
   }
 
   async initDb() {
@@ -46,44 +48,23 @@ class KeyStorage {
         activated TEXT
       )
     `).catch(() => {});
-    // Dong bo DB vao memCache khi khoi dong
+    
     try {
       const res = await pool.query("SELECT * FROM keys");
       this.memCache = Object.fromEntries(res.rows.map(r => [r.key_text, r]));
     } catch {}
   }
 
-  async loadAll() {
-    if (this.useDb) {
-      try {
-        const res = await pool.query("SELECT * FROM keys");
-        const dbData = Object.fromEntries(res.rows.map(r => [r.key_text, r]));
-        this.memCache = { ...this.memCache, ...dbData };
-      } catch {}
-    } else {
-      // Thu doc file, merge vao cache
-      try {
-        if (fs.existsSync(this.keyFile)) {
-          const fileData = JSON.parse(fs.readFileSync(this.keyFile, "utf-8"));
-          this.memCache = { ...fileData, ...this.memCache };
-        }
-      } catch {}
-    }
-    // Luon tra ve tu memCache (khong bao gio bi mat khi file reset)
-    return { ...this.memCache };
-  }
-
-  async saveAll(keys) {
-    // Luon luu vao memCache truoc
-    this.memCache = { ...keys };
+  // Luôn ghi đè file bằng memCache để tránh mất dữ liệu
+  async syncToFile() {
     if (this.useDb) return;
-    // Co gang ghi file (khong crash neu that bai)
-    try { fs.writeFileSync(this.keyFile, JSON.stringify(keys, null, 2)); } catch {}
+    try { fs.writeFileSync(this.keyFile, JSON.stringify(this.memCache, null, 2)); } catch {}
   }
 
   async setKey(keyText, data) {
-    // Luon luu vao memCache ngay lap tuc
     this.memCache[keyText] = data;
+    this.syncToFile();
+    
     if (this.useDb) {
       try {
         await pool.query(
@@ -95,34 +76,25 @@ class KeyStorage {
            data.created || new Date().toISOString(), data.activated || null]
         );
       } catch (e) { console.error("setKey DB error:", e.message); }
-    } else {
-      const keys = await this.loadAll();
-      keys[keyText] = data;
-      await this.saveAll(keys);
     }
   }
 
   async getUserKey(userId) {
-    const keys = await this.loadAll();
-    const entry = Object.entries(keys).find(([_, v]) => String(v.user_id) === String(userId));
+    const entry = Object.entries(this.memCache).find(([_, v]) => String(v.user_id) === String(userId));
     return entry ? { key_text: entry[0], ...entry[1] } : null;
   }
 
   async getKey(keyText) {
-    const keys = await this.loadAll();
-    return keys[keyText] ? { key_text: keyText, ...keys[keyText] } : null;
+    return this.memCache[keyText] ? { key_text: keyText, ...this.memCache[keyText] } : null;
   }
 
-  // ── Kích hoạt key – bắt đầu đếm giờ ĐÚNG từ lúc user kích hoạt ────────────
   async activateKey(keyText, userId) {
-    const keys = await this.loadAll();
-    let k = keys[keyText];
+    let k = this.memCache[keyText];
     if (!k) return { ok: false, msg: "❌ Key không tồn tại!" };
     if (k.user_id && String(k.user_id) !== String(userId))
       return { ok: false, msg: "❌ Key này đã được dùng bởi người khác!" };
 
     if (!k.user_id) {
-      // Key chưa gắn user → gắn ngay, bắt đầu đếm giờ từ thời điểm KÍCH HOẠT
       const pkg = k.pkg;
       const hours = PACKAGES[pkg] ? PACKAGES[pkg].hours : null;
       const nowIso = new Date().toISOString();
@@ -130,6 +102,7 @@ class KeyStorage {
       k.user_id = String(userId);
       k.expire = expire;
       k.activated = nowIso;
+      
       if (this.useDb) {
         try {
           await pool.query(
@@ -137,30 +110,19 @@ class KeyStorage {
             [String(userId), expire, nowIso, keyText]
           );
         } catch (e) { console.error("activateKey DB error:", e.message); }
-      } else {
-        keys[keyText] = k;
-        await this.saveAll(keys);
       }
-    } else {
-      // Key đã gắn user_id (tạo bằng /taokey userId pkg) → chỉ đảm bảo memCache đúng
-      k = { ...k, user_id: String(k.user_id) };
     }
 
-    // QUAN TRỌNG: Luôn đồng bộ vào memCache sau mọi trường hợp
     this.memCache[keyText] = k;
-
+    this.syncToFile();
     return { ok: true, key: { key_text: keyText, ...k } };
   }
 
   async deleteKey(keyText) {
-    // Luon xoa khoi memCache ngay
     delete this.memCache[keyText];
+    this.syncToFile();
     if (this.useDb) {
       try { await pool.query(`DELETE FROM keys WHERE key_text=$1`, [keyText]); } catch {}
-    } else {
-      const keys = await this.loadAll();
-      delete keys[keyText];
-      await this.saveAll(keys);
     }
   }
 }
@@ -168,11 +130,9 @@ class KeyStorage {
 const storage = new KeyStorage();
 
 // ─── CONFIG ──────────────────────────────────────────────────────────────────
-// FIX: Thay token bot mới
 const BOT_TOKEN = process.env.BOT_TOKEN || "8640872279:AAHmCc9ezSBMjJNA7HEMLmeuWvXb7aRrues";
 const ADMIN_ID = 7680266707;
 const API_URL = "https://treo-lc79-h6zy.onrender.com/";
-// API MD5 riêng (nếu có endpoint khác, đổi ở đây)
 const API_MD5_URL = "https://treo-lc79-h6zy.onrender.com/";
 
 const PACKAGES = {
@@ -183,8 +143,7 @@ const PACKAGES = {
   "vinhvien": { label: "Vĩnh Viễn ♾️", hours: null },
 };
 
-// ─── WIN/LOSS STORE (bộ nhớ trong phiên) ────────────────────────────────────
-// lưu theo userId: { win: 0, loss: 0, lastPrediction: null, lastSessionId: null }
+// ─── WIN/LOSS STORE ──────────────────────────────────────────────────────────
 const userStats = {};
 function getStats(userId) {
   if (!userStats[userId]) userStats[userId] = { win: 0, loss: 0, lastPrediction: null, lastSessionId: null };
@@ -192,13 +151,11 @@ function getStats(userId) {
 }
 
 // ─── AUTO-PREDICT STORE ───────────────────────────────────────────────────────
-// lưu chatId → { messageId, intervalId, lastSessionId }
 const autoSessions = {};
 
 // ─── KEY VALIDATION ──────────────────────────────────────────────────────────
 function isKeyValid(key) {
-  if (!key) return false;
-  if (!key.user_id) return false;
+  if (!key || !key.user_id) return false;
   if (key.expire === "never") return true;
   const expireMs = new Date(key.expire).getTime();
   return !isNaN(expireMs) && expireMs > Date.now();
@@ -230,49 +187,35 @@ function extractListFromResponse(data) {
   if (data && Array.isArray(data.list)) return data.list;
   if (data && Array.isArray(data.items)) return data.items;
   if (data && data.data && Array.isArray(data.data.list)) return data.data.list;
-  if (data && data.data && Array.isArray(data.data.items)) return data.data.items;
   return [];
 }
 
 function extractDiceFromSession(s) {
   if (Array.isArray(s.dices) && s.dices.length >= 3) return s.dices.map(Number);
   if (Array.isArray(s.dice) && s.dice.length >= 3) return s.dice.map(Number);
-  if (typeof s.openCode === "string" && s.openCode.includes(",")) {
-    const d = s.openCode.split(",").map(Number);
-    if (d.length >= 3 && d.every(n => !isNaN(n) && n >= 1 && n <= 6)) return d;
-  }
-  if (typeof s.open_code === "string" && s.open_code.includes(",")) {
-    const d = s.open_code.split(",").map(Number);
-    if (d.length >= 3 && d.every(n => !isNaN(n) && n >= 1 && n <= 6)) return d;
-  }
-  if (typeof s.openNum === "string") {
-    const d = s.openNum.split(/[,\-\s]/).map(Number).filter(n => !isNaN(n) && n >= 1 && n <= 6);
-    if (d.length >= 3) return d;
-  }
+  if (typeof s.openCode === "string" && s.openCode.includes(",")) return s.openCode.split(",").map(Number);
+  if (typeof s.open_code === "string" && s.open_code.includes(",")) return s.open_code.split(",").map(Number);
   return [];
 }
 
 function extractSessionId(s) {
-  const raw = s.phien || s.issue || s.id || s.session || s.period || s.expect || s.no || "";
+  const raw = s.phien || s.issue || s.id || s.session || s.period || "";
   return String(raw).trim();
 }
 
 function extractMd5(s) {
-  return s.md5 || s.hash || s.openMd5 || s.md5Hash || s.verification || "";
+  return s.md5 || s.hash || s.openMd5 || s.md5Hash || "";
 }
 
-// ── FIX CHUẨN: Tổng 3-10 = XỈU, Tổng 11-18 = TÀI ───────────────────────────
 function resultFromDice(dice) {
   if (!dice || dice.length < 3) return null;
   const sum = dice[0] + dice[1] + dice[2];
-  // Xúc xắc hợp lệ: mỗi viên 1-6, tổng từ 3 đến 18
   if (sum < 3 || sum > 18) return null;
-  return sum >= 11 ? "TAI" : "XIU"; // 11-18 = TÀI, 3-10 = XỈU
+  return sum >= 11 ? "TAI" : "XIU"; // Đảm bảo: 11-18 = Tài, 3-10 = Xỉu
 }
 
 function resultFromField(s) {
-  const r = (s.result || s.txType || s.type_result || s.resultType || s.taixiu || "")
-    .toString().toUpperCase().trim();
+  const r = (s.result || s.txType || s.type_result || s.resultType || s.taixiu || "").toString().toUpperCase().trim();
   if (r === "1" || r === "TAI" || r.includes("TÀI") || r === "BIG" || r === "T") return "TAI";
   if (r === "0" || r === "XIU" || r.includes("XỈU") || r === "SMALL" || r === "X") return "XIU";
   return null;
@@ -284,18 +227,11 @@ function normalizeSession(s) {
   if (!idStr) return null;
   const numStr = idStr.replace(/\D/g, "");
   const id_num = numStr ? parseInt(numStr) : 0;
-
   const dice = extractDiceFromSession(s);
-  const md5 = extractMd5(s);
-
-  // Ưu tiên tính từ dice (chính xác nhất)
-  let result = dice.length >= 3 ? resultFromDice(dice) : null;
-  // Nếu không có dice hợp lệ, đọc từ trường result
-  if (!result) result = resultFromField(s);
+  let result = dice.length >= 3 ? resultFromDice(dice) : resultFromField(s);
   if (!result) return null;
-
   const diceSum = dice.length >= 3 ? dice[0] + dice[1] + dice[2] : 0;
-  return { id: idStr, id_num, diceSum, dice, result, md5 };
+  return { id: idStr, id_num, diceSum, dice, result, md5: extractMd5(s) };
 }
 
 // ─── MD5 SEQUENCE ANALYSIS ───────────────────────────────────────────────────
@@ -303,22 +239,13 @@ function analyzeMd5Hash(md5String) {
   if (!md5String || md5String.length < 32) return null;
   try {
     const h = md5String.toLowerCase();
-    // Lấy nhiều đặc trưng hơn để so sánh
     const byteSum = h.split("").reduce((acc, c) => acc + parseInt(c, 16), 0);
-    const firstHalf = h.slice(0, 16);
-    const secondHalf = h.slice(16, 32);
-    const num1 = parseInt(firstHalf.slice(-8), 16) || 0;
-    const num2 = parseInt(secondHalf.slice(-8), 16) || 0;
-    const mod11 = num1 % 11;
-    const mod7  = num2 % 7;
-    const evenOdd = (num1 + num2) % 2;
-    // Phân vùng: chia byteSum thành 10 bucket
-    const bucket = Math.floor(byteSum / 10) % 10;
-    return { byteSum, mod11, mod7, evenOdd, bucket };
+    const num1 = parseInt(h.slice(0, 16).slice(-8), 16) || 0;
+    const num2 = parseInt(h.slice(16, 32).slice(-8), 16) || 0;
+    return { byteSum, mod11: num1 % 11, mod7: num2 % 7, evenOdd: (num1 + num2) % 2, bucket: Math.floor(byteSum / 10) % 10 };
   } catch { return null; }
 }
 
-// Xây map: md5 của phiên N → kết quả phiên N+1 (dùng TOÀN BỘ lịch sử)
 function buildMd5SequenceMap(sessions) {
   const sortedAsc = [...sessions].sort((a, b) => a.id_num - b.id_num);
   const sequence = [];
@@ -326,12 +253,7 @@ function buildMd5SequenceMap(sessions) {
     const cur = sortedAsc[i];
     const next = sortedAsc[i + 1];
     if (cur.md5 && next.result) {
-      sequence.push({
-        md5: cur.md5,
-        analysis: analyzeMd5Hash(cur.md5),
-        nextResult: next.result,
-        curDiceSum: cur.diceSum,
-      });
+      sequence.push({ md5: cur.md5, analysis: analyzeMd5Hash(cur.md5), nextResult: next.result });
     }
   }
   return sequence;
@@ -342,7 +264,6 @@ function predictFromMd5(currentMd5, sequenceMap) {
   const target = analyzeMd5Hash(currentMd5);
   if (!target) return null;
 
-  // Tìm các entry lịch sử có đặc trưng gần giống nhất
   const scored = sequenceMap.map(item => {
     if (!item.analysis) return { ...item, score: 0 };
     let score = 0;
@@ -351,337 +272,115 @@ function predictFromMd5(currentMd5, sequenceMap) {
     if (item.analysis.mod11 === target.mod11) score += 3;
     if (item.analysis.mod7 === target.mod7) score += 2;
     if (Math.abs(item.analysis.byteSum - target.byteSum) <= 5) score += 4;
-    else if (Math.abs(item.analysis.byteSum - target.byteSum) <= 12) score += 2;
     return { ...item, score };
   });
 
-  // Lấy top 30% giống nhất (ít nhất 10 mẫu)
   scored.sort((a, b) => b.score - a.score);
-  const topN = Math.max(10, Math.floor(scored.length * 0.3));
-  const similar = scored.slice(0, topN).filter(x => x.score >= 3);
+  const similar = scored.slice(0, Math.max(10, Math.floor(scored.length * 0.3))).filter(x => x.score >= 3);
   if (similar.length < 5) return null;
 
   const taiCount = similar.filter(x => x.nextResult === "TAI").length;
-  const xiuCount = similar.length - taiCount;
   const taiRate = (taiCount / similar.length) * 100;
 
-  if (taiRate >= 62) return { pred: "TAI", conf: Math.round(taiRate), samples: similar.length };
-  if (taiRate <= 38) return { pred: "XIU", conf: Math.round(100 - taiRate), samples: similar.length };
-  return null; // không đủ chắc
-}
-
-// ─── PHÂN TÍCH CẦU NÂNG CAO ──────────────────────────────────────────────────
-function detectPatterns(results) {
-  const n = results.length;
-  if (n < 4) return {};
-
-  // Bệt hiện tại
-  let streak = 1;
-  const last = results[0];
-  for (let i = 1; i < n; i++) {
-    if (results[i] === last) streak++;
-    else break;
-  }
-
-  // Cầu 1-1 (đảo liên tục)
-  let pingpongLen = 0;
-  for (let i = 0; i < n - 1; i++) {
-    if (results[i] !== results[i + 1]) pingpongLen++;
-    else break;
-  }
-
-  // Cầu đôi (2-2-2: TT-XX-TT...)
-  let doublePairLen = 0;
-  let i = 0;
-  while (i + 1 < n && results[i] === results[i + 1]) {
-    doublePairLen++;
-    i += 2;
-  }
-
-  // Cầu ba (TTT-XXX-TTT)
-  let triplePairLen = 0;
-  let j = 0;
-  while (j + 2 < n && results[j] === results[j + 1] && results[j + 1] === results[j + 2]) {
-    triplePairLen++;
-    j += 3;
-  }
-
-  // Kiểm tra xem cầu đôi/ba có đang ở giữa cặp không
-  const inDoubleFirst = streak === 1 && n >= 2 && results[1] !== results[0];
-  const inDoubleSecond = streak === 2 && n >= 3 && results[2] !== results[0];
-
-  // Phát hiện cầu bẻ điểm (zigzag: T-X-T hoặc X-T-X trong 5 phiên gần nhất)
-  let zigzagScore = 0;
-  for (let k = 0; k < Math.min(6, n - 2); k++) {
-    if (results[k] !== results[k + 1] && results[k] === results[k + 2]) zigzagScore++;
-  }
-
-  // Tỉ lệ chuỗi: số phiên "bệt" trong 20 phiên
-  const window20 = results.slice(0, Math.min(20, n));
-  let longestRun = 1, curRun = 1;
-  for (let k = 1; k < window20.length; k++) {
-    if (window20[k] === window20[k - 1]) { curRun++; longestRun = Math.max(longestRun, curRun); }
-    else curRun = 1;
-  }
-
-  return {
-    streak, last,
-    pingpongLen,
-    doublePairLen,
-    triplePairLen,
-    zigzagScore,
-    longestRun,
-    inDoubleFirst,
-    inDoubleSecond,
-  };
+  if (taiRate >= 60) return { pred: "TAI", conf: Math.round(taiRate), samples: similar.length };
+  if (taiRate <= 40) return { pred: "XIU", conf: Math.round(100 - taiRate), samples: similar.length };
+  return null;
 }
 
 // ─── THUẬT TOÁN DỰ ĐOÁN TOÀN DIỆN ───────────────────────────────────────────
 function analyzeSmart(sessions) {
-  if (!sessions || sessions.length < 3) {
-    return { prediction: "XIU", confidence: 50, reason: "⚠️ Đang thu thập dữ liệu..." };
-  }
+  if (!sessions || sessions.length < 3) return { prediction: "XIU", confidence: 50, reason: "⚠️ Đang thu thập dữ liệu..." };
 
   const results = sessions.map(s => s.result);
   const n = results.length;
-  const windowSize = Math.min(20, n);
+  
+  // Phân tích bệt
+  let streak = 1;
+  const last = results[0];
+  for (let i = 1; i < n; i++) { if (results[i] === last) streak++; else break; }
 
-  // Tỷ lệ Tài/Xỉu trong 20 phiên
-  const taiCount20 = results.slice(0, windowSize).filter(r => r === "TAI").length;
-  const taiRate20 = (taiCount20 / windowSize) * 100;
+  // Cầu 1-1
+  let pingpongLen = 0;
+  for (let i = 0; i < n - 1; i++) { if (results[i] !== results[i + 1]) pingpongLen++; else break; }
 
-  // Tỷ lệ trong 50 phiên (xu hướng dài hạn)
-  const windowSize50 = Math.min(50, n);
-  const taiCount50 = results.slice(0, windowSize50).filter(r => r === "TAI").length;
-  const taiRate50 = (taiCount50 / windowSize50) * 100;
-
-  // Phân tích cầu
-  const pat = detectPatterns(results);
-  const { streak, last, pingpongLen, doublePairLen, triplePairLen, zigzagScore } = pat;
-
-  // MD5 phân tích từ TOÀN BỘ lịch sử
+  // MD5 analysis
   const md5Map = buildMd5SequenceMap(sessions);
   const md5Pred = predictFromMd5(sessions[0].md5, md5Map);
 
-  // Phân tích dice điểm gần đây
+  // Phân tích tổng xúc xắc: 3-10 (Xỉu), 11-18 (Tài)
   const recentDice = sessions.slice(0, Math.min(10, n)).filter(s => s.dice.length >= 3);
-  const avgSum = recentDice.length > 0
-    ? recentDice.reduce((acc, s) => acc + s.diceSum, 0) / recentDice.length : 10.5;
+  const avgSum = recentDice.length > 0 ? recentDice.reduce((acc, s) => acc + s.diceSum, 0) / recentDice.length : 10.5;
+  const diceTrendStr = avgSum <= 10 ? "XỈU (3-10 điểm)" : "TÀI (11-18 điểm)";
 
   let prediction = "";
   let confidence = 60;
   let reason = "";
-  let methodTag = "";
 
-  // ── BẺCẦU MẠNH: bệt rất dài (≥6) ─────────────────────────────────────────
   if (streak >= 6) {
     prediction = last === "TAI" ? "XIU" : "TAI";
     confidence = Math.min(95, 80 + streak * 2);
-    reason = `🔥 <b>BẺ CẦU CỰC MẠNH:</b> ${last === "TAI" ? "TÀI" : "XỈU"} bệt <b>${streak}</b> phiên! Xác suất gãy cực cao. Vào bẻ cầu ngay!`;
-    methodTag = "BẺ_CẦU_DÀI";
-  }
-  // ── BẺ CẦU THƯỜNG (streak 4-5) ────────────────────────────────────────────
-  else if (streak >= 4) {
+    reason = `🔥 <b>BẺ CẦU CỰC MẠNH:</b> ${last === "TAI" ? "TÀI" : "XỈU"} đã bệt ${streak} tay. Tổng 3 xúc xắc đang nghiêng về ${diceTrendStr}, vào bẻ cầu ngay!`;
+  } else if (streak >= 4) {
     prediction = last === "TAI" ? "XIU" : "TAI";
     confidence = Math.min(88, 72 + streak * 3);
-    const support = md5Pred && md5Pred.pred !== last ? ` (MD5 xác nhận ${md5Pred.conf}%)` : "";
-    reason = `🔥 <b>BẺ CẦU:</b> ${last === "TAI" ? "TÀI" : "XỈU"} bệt ${streak} phiên, đến điểm gãy.${support}`;
-    methodTag = "BẺ_CẦU";
-  }
-  // ── CẦU ĐẢO 1-1 MẠNH (≥5 đảo liên tiếp) ─────────────────────────────────
-  else if (pingpongLen >= 5) {
+    reason = `🔥 <b>BẺ CẦU:</b> Bệt ${streak} phiên. Áp dụng quy tắc xúc xắc hiện đang theo ${diceTrendStr}, đến điểm gãy.`;
+  } else if (pingpongLen >= 5) {
     prediction = last === "TAI" ? "XIU" : "TAI";
     confidence = 85;
-    reason = `🔄 <b>CẦU ĐẢO 1-1 MẠNH:</b> Đảo liên tục ${pingpongLen} phiên. Đánh theo nhịp đảo (${last === "TAI" ? "TÀI→XỈU" : "XỈU→TÀI"}).`;
-    methodTag = "CẦU_ĐẢO_MẠNH";
-  }
-  // ── CẦU BA (TTT-XXX) ──────────────────────────────────────────────────────
-  else if (triplePairLen >= 2) {
-    if (streak === 3) {
-      // Vừa hoàn thành 1 cặp ba, sang cặp mới → đảo
-      prediction = last === "TAI" ? "XIU" : "TAI";
-      confidence = 82;
-      reason = `🧊 <b>CẦU BA (3-3):</b> Vừa đủ 3 phiên ${last === "TAI" ? "TÀI" : "XỈU"}, bắt đầu cặp 3 mới (đảo sang ${last === "TAI" ? "XỈU" : "TÀI"}).`;
-      methodTag = "CẦU_BA_ĐẢO";
-    } else if (streak < 3) {
-      // Đang trong cặp ba → theo
-      prediction = last;
-      confidence = 80;
-      reason = `🧊 <b>CẦU BA (3-3):</b> Đang đi cặp 3 ${last === "TAI" ? "TÀI" : "XỈU"} (phiên ${streak}/3). Theo cầu.`;
-      methodTag = "CẦU_BA_THEO";
-    }
-  }
-  // ── CẦU ĐÔI (TT-XX-TT) ────────────────────────────────────────────────────
-  else if (doublePairLen >= 2) {
-    if (streak === 2) {
-      // Vừa đủ cặp đôi → sang cặp mới (đảo)
-      prediction = last === "TAI" ? "XIU" : "TAI";
-      confidence = 80;
-      reason = `🧩 <b>CẦU ĐÔI (2-2):</b> Vừa hoàn thành 2 phiên ${last === "TAI" ? "TÀI" : "XỈU"}, đảo sang cặp ${last === "TAI" ? "XỈU" : "TÀI"}.`;
-      methodTag = "CẦU_ĐÔI_ĐẢO";
-    } else if (streak === 1) {
-      // Phiên đầu cặp mới → theo để đủ đôi
-      prediction = last;
-      confidence = 78;
-      reason = `🧩 <b>CẦU ĐÔI (2-2):</b> Phiên 1/2 cặp ${last === "TAI" ? "TÀI" : "XỈU"}, theo tiếp để đủ đôi.`;
-      methodTag = "CẦU_ĐÔI_THEO";
-    }
-  }
-  // ── CẦU ĐẢO 1-1 NHẸ ──────────────────────────────────────────────────────
-  else if (pingpongLen >= 3) {
-    prediction = last === "TAI" ? "XIU" : "TAI";
-    confidence = 76;
-    reason = `🔄 <b>CẦU ĐẢO 1-1:</b> Nhịp đảo ${pingpongLen} phiên. Theo nhịp (${last === "TAI" ? "TÀI→XỈU" : "XỈU→TÀI"}).`;
-    methodTag = "CẦU_ĐẢO";
-  }
-  // ── THEO CẦU NGẮN (streak 2-3) ────────────────────────────────────────────
-  else if (streak >= 2 && streak <= 3) {
-    const md5Confirm = md5Pred && md5Pred.pred === last;
-    if (md5Confirm) {
-      prediction = last;
-      confidence = Math.round(Math.min(82, (72 + md5Pred.conf) / 2));
-      reason = `📈 <b>THEO CẦU + MD5 XÁC NHẬN:</b> Xu hướng ${last === "TAI" ? "TÀI" : "XỈU"} được MD5 xác nhận (${md5Pred.conf}%, ${md5Pred.samples} mẫu).`;
-      methodTag = "THEO_CẦU_MD5";
-    } else {
-      prediction = last;
-      confidence = 70;
-      reason = `📈 <b>THEO CẦU:</b> Xu hướng ${last === "TAI" ? "TÀI" : "XỈU"} đang hình thành (${streak} phiên liên tiếp).`;
-      methodTag = "THEO_CẦU";
-    }
-  }
-  // ── MD5 PATTERN THUẦN TÚY ─────────────────────────────────────────────────
-  else if (md5Pred) {
+    reason = `🔄 <b>THEO CẦU 1-1 MẠNH:</b> Đảo liên tục ${pingpongLen} tay. Đánh theo nhịp đảo kết hợp ${diceTrendStr}.`;
+  } else if (streak >= 2 && streak <= 3) {
+    prediction = last;
+    confidence = 75;
+    reason = `📈 <b>MẠNH MẼ THEO CẦU:</b> Xu hướng ${last === "TAI" ? "TÀI" : "XỈU"} đang hình thành đẹp, điểm 3 xúc xắc hướng về ${diceTrendStr}.`;
+  } else if (md5Pred) {
     prediction = md5Pred.pred;
     confidence = md5Pred.conf;
-    reason = `🔬 <b>PHÂN TÍCH MD5:</b> ${md5Pred.pred === "TAI" ? "TÀI" : "XỈU"} theo pattern hash lịch sử (${md5Pred.conf}%, phân tích ${md5Pred.samples}/${md5Map.length} mẫu).`;
-    methodTag = "MD5";
-  }
-  // ── TỔNG ĐIỂM XÚC XẮC + TỶ LỆ ───────────────────────────────────────────
-  else {
-    // Dùng kết hợp: điểm trung bình xúc xắc gần đây + tỷ lệ dài hạn
-    const diceSignal = avgSum > 10.5 ? "XIU" : "TAI"; // nếu avg cao → xu hướng về XIU
-    if (taiRate20 >= 65) {
-      prediction = "XIU";
-      confidence = Math.round(50 + (taiRate20 - 50) * 0.8);
-      reason = `⚖️ <b>CÂN BẰNG:</b> TÀI chiếm ${taiRate20.toFixed(0)}% trong 20 phiên (xu hướng dài: ${taiRate50.toFixed(0)}%). Về XIU để cân bằng.`;
-      methodTag = "CÂN_BẰNG";
-    } else if (taiRate20 <= 35) {
-      prediction = "TAI";
-      confidence = Math.round(50 + (50 - taiRate20) * 0.8);
-      reason = `⚖️ <b>CÂN BẰNG:</b> XỈU chiếm ${(100 - taiRate20).toFixed(0)}% trong 20 phiên (xu hướng dài: ${(100 - taiRate50).toFixed(0)}%). Về TÀI để cân bằng.`;
-      methodTag = "CÂN_BẰNG";
-    } else {
-      // Dựa vào điểm trung bình
-      prediction = diceSignal;
-      confidence = 60;
-      reason = `📊 <b>THỐNG KÊ:</b> TÀI: ${taiRate20.toFixed(0)}% / XỈU: ${(100 - taiRate20).toFixed(0)}% (20 phiên). Tổng trung bình gần đây: ${avgSum.toFixed(1)}.`;
-      methodTag = "THỐNG_KÊ";
-    }
+    reason = `🔬 <b>THEO MD5:</b> Dự đoán ${md5Pred.pred === "TAI" ? "TÀI" : "XỈU"} theo lịch sử mã hash (${md5Pred.conf}%), xúc xắc: ${diceTrendStr}.`;
+  } else {
+    prediction = avgSum <= 10 ? "XIU" : "TAI";
+    confidence = 65;
+    reason = `📊 <b>THEO XÚC XẮC:</b> Điểm 3 xúc xắc trung bình: ${avgSum.toFixed(1)} -> Nghiêng về ${diceTrendStr}.`;
   }
 
-  return {
-    prediction,
-    confidence,
-    reason,
-    taiRate: taiRate20,
-    taiRate50,
-    streak,
-    lastRes: last,
-    md5Used: !!md5Pred,
-    md5Samples: md5Map.length,
-    avgSum,
-    pattern: pat,
-    methodTag,
-  };
-}
-
-// ─── TREND BAR + DICE DISPLAY ────────────────────────────────────────────────
-function buildTrendBar(sessions) {
-  return sessions
-    .slice()
-    .reverse()
-    .map(s => {
-      const icon = s.result === "TAI" ? "🔴" : "⚪";
-      return s.diceSum ? `${icon}${s.diceSum}` : icon;
-    })
-    .join(" ");
+  return { prediction, confidence, reason };
 }
 
 function buildDiceDisplay(dice, sum) {
   if (!dice || dice.length < 3) return "? ? ? | ?";
   const faces = ["", "⚀", "⚁", "⚂", "⚃", "⚄", "⚅"];
   const emojis = dice.map(d => (d >= 1 && d <= 6) ? faces[d] : "?").join(" ");
-  return `${emojis} | ${dice.join("+")} = <b>${sum}</b>`;
+  return `${emojis} | Tổng: <b>${sum}</b>`;
 }
 
-// ─── XÂY MESSAGE DỰ ĐOÁN ─────────────────────────────────────────────────────
 function buildPredictMessage(sessions, key, stats) {
   if (!sessions || sessions.length === 0) return null;
-
   const latest = sessions[0];
   const analysis = analyzeSmart(sessions);
   const nextId = latest.id_num + 1;
   const predLabel = analysis.prediction === "TAI" ? "TÀI 🔴" : "XỈU ⚪";
-  const trendBar = buildTrendBar(sessions.slice(0, 12));
-  const diceDisp = buildDiceDisplay(latest.dice, latest.diceSum);
-
-  // Phát hiện tổng xúc xắc đặc biệt
-  let sumNote = "";
-  if (latest.diceSum === 3) sumNote = " 🎯 (bộ ba 1)";
-  else if (latest.diceSum === 18) sumNote = " 🎯 (bộ ba 6)";
-  else if (latest.dice.every(d => d === latest.dice[0])) sumNote = " 🎲 (ba số giống)";
-
+  
   const { win = 0, loss = 0 } = stats;
   const total = win + loss;
   const winRate = total > 0 ? ((win / total) * 100).toFixed(0) : "—";
 
-  const trendNote =
-    analysis.streak >= 3
-      ? `⚡ Bệt ${analysis.streak} phiên ${analysis.lastRes === "TAI" ? "TÀI" : "XỈU"}`
-      : analysis.pattern && analysis.pattern.pingpongLen >= 3
-      ? `🔄 Cầu đảo ${analysis.pattern.pingpongLen} phiên`
-      : `Tài/Xỉu: ${analysis.taiRate.toFixed(0)}%/${(100 - analysis.taiRate).toFixed(0)}%`;
-
   return (
     `📌 <b>Phiên vừa mở: #${latest.id}</b>\n` +
-    `🎲 Xúc xắc: ${diceDisp}${sumNote}\n` +
+    `🎲 Xúc xắc: ${buildDiceDisplay(latest.dice, latest.diceSum)}\n` +
     `🏆 Kết quả: <b>${latest.result === "TAI" ? "TÀI 🔴" : "XỈU ⚪"}</b>\n` +
     `━━━━━━━━━━━━━━━━━━━━\n` +
-    `🔮 <b>DỰ ĐOÁN PHIÊN #${nextId}:</b>\n` +
+    `🔮 <b>DỰ ĐOÁN PHIÊN MỚI #${nextId}:</b>\n` +
     `🎯 <b>${predLabel}</b>  |  Độ tin cậy: <b>${analysis.confidence}%</b>\n` +
     `💡 ${analysis.reason}\n` +
-    `━━━━━━━━━━━━━━━━━━━━\n` +
-    `📊 Xu hướng: ${trendNote}\n` +
-    `📉 12 phiên gần nhất:\n<code>${trendBar}</code>\n` +
-    (analysis.md5Used ? `🔬 MD5 phân tích: <b>${analysis.md5Samples}</b> mẫu lịch sử\n` : "") +
     `━━━━━━━━━━━━━━━━━━━━\n` +
     `📈 Thắng: <b>${win}</b>  Thua: <b>${loss}</b>  Tỉ lệ: <b>${winRate}%</b>\n` +
     `⏰ Key còn: <b>${timeRemaining(key)}</b>`
   );
 }
 
-// ─── CẬP NHẬT THẮNG/THUA ─────────────────────────────────────────────────────
-// So sánh dự đoán phiên trước với kết quả thực tế phiên vừa mở
-function updateWinLoss(userId, newSessionId, newResult) {
-  const st = getStats(userId);
-  if (!st.lastPrediction || !st.lastSessionId) return;
-  // Chỉ tính khi phiên mới khác phiên cũ
-  if (st.lastSessionId === newSessionId) return;
-  if (st.lastPrediction === newResult) st.win++;
-  else st.loss++;
-  st.lastSessionId = null;
-  st.lastPrediction = null;
-}
-
-// ─── AUTO PREDICT ─────────────────────────────────────────────────────────────
+// ─── AUTO PREDICT CẬP NHẬT TỨC THÌ ───────────────────────────────────────────
 async function fetchAndPredict(userId, chatId, messageId, ctx) {
   try {
-    // Ưu tiên đọc thẳng từ memCache để tránh lỗi key không tìm thấy
-    const key = storage.memCache
-      ? Object.entries(storage.memCache).find(([_, v]) => String(v.user_id) === String(userId))
-      : null;
-    const keyObj = key ? { key_text: key[0], ...key[1] } : await storage.getUserKey(userId);
-
+    const keyObj = await storage.getUserKey(userId);
     if (!keyObj || !isKeyValid(keyObj)) {
       stopAutoPredict(userId, chatId);
       try {
@@ -693,53 +392,25 @@ async function fetchAndPredict(userId, chatId, messageId, ctx) {
       return;
     }
 
-    let resp;
-    try {
-      resp = await axios.get(API_URL, {
-        timeout: 15000,
-        headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" },
-      });
-    } catch (apiErr) {
-      console.error("API fetch error:", apiErr.message);
-      // Không xóa message, chờ lần sau retry
-      try {
-        await ctx.telegram.editMessageText(chatId, messageId, undefined,
-          `⏳ <b>Đang tải dữ liệu API...</b>
-🔄 Tự động cập nhật mỗi 20 giây.
-
-⚠️ API đang chậm, đang thử lại...`,
-          { parse_mode: "HTML", ...Markup.inlineKeyboard([
-            [Markup.button.callback("⏹ Dừng tự động", `stop_auto_${userId}`)],
-          ]) }
-        );
-      } catch {}
-      return;
-    }
-
+    const resp = await axios.get(API_URL, { timeout: 15000 });
     const list = extractListFromResponse(resp.data);
-    if (list.length === 0) return;
-
-    const sessions = list
-      .map(normalizeSession)
-      .filter(Boolean)
-      .sort((a, b) => b.id_num - a.id_num);
+    const sessions = list.map(normalizeSession).filter(Boolean).sort((a, b) => b.id_num - a.id_num);
     if (sessions.length === 0) return;
 
     const latest = sessions[0];
     const st = getStats(userId);
 
-    // Cập nhật thắng/thua dựa vào kết quả phiên vừa mở
-    updateWinLoss(userId, latest.id, latest.result);
-
-    // Tính dự đoán mới
-    const analysis = analyzeSmart(sessions);
-
-    // Lưu dự đoán hiện tại (cho phiên tiếp theo)
-    st.lastPrediction = analysis.prediction;
-    st.lastSessionId = String(latest.id_num + 1);
+    // Cập nhật khi phiên mới xuất hiện
+    if (st.lastSessionId && st.lastSessionId !== String(latest.id_num)) {
+      if (st.lastPrediction === latest.result) st.win++;
+      else st.loss++;
+    }
 
     const msg = buildPredictMessage(sessions, keyObj, st);
     if (!msg) return;
+
+    st.lastPrediction = analyzeSmart(sessions).prediction;
+    st.lastSessionId = String(latest.id_num);
 
     try {
       await ctx.telegram.editMessageText(chatId, messageId, undefined, msg, {
@@ -749,21 +420,15 @@ async function fetchAndPredict(userId, chatId, messageId, ctx) {
           [Markup.button.callback("🏠 Menu chính", "main_menu")],
         ]),
       });
-    } catch (e) {
-      // Tin nhắn không đổi hoặc lỗi nhỏ → bỏ qua
-    }
-  } catch (e) {
-    console.error("AutoPredict error:", e.message);
-  }
+    } catch (e) { /* Tin nhắn không đổi */ }
+  } catch (e) { console.error("AutoPredict error:", e.message); }
 }
 
 function startAutoPredict(userId, chatId, messageId, ctx) {
-  stopAutoPredict(userId, chatId); // dừng cũ nếu có
-  const intervalId = setInterval(() => {
-    fetchAndPredict(userId, chatId, messageId, ctx);
-  }, 20000); // 20 giây
+  stopAutoPredict(userId, chatId);
+  // Quét 15 giây 1 lần để nhạy với phiên mới nhất
+  const intervalId = setInterval(() => fetchAndPredict(userId, chatId, messageId, ctx), 15000); 
   autoSessions[`${userId}_${chatId}`] = { intervalId, messageId };
-  // Chạy ngay lần đầu
   fetchAndPredict(userId, chatId, messageId, ctx);
 }
 
@@ -773,18 +438,6 @@ function stopAutoPredict(userId, chatId) {
     clearInterval(autoSessions[key].intervalId);
     delete autoSessions[key];
   }
-}
-
-// ─── HELPER: Đọc key ưu tiên memCache ────────────────────────────────────────
-async function getKeyForUser(userId) {
-  // Đọc thẳng từ memCache trước (nhanh & đáng tin cậy nhất)
-  if (storage.memCache) {
-    const entry = Object.entries(storage.memCache)
-      .find(([_, v]) => String(v.user_id) === String(userId));
-    if (entry) return { key_text: entry[0], ...entry[1] };
-  }
-  // Fallback: đọc từ DB / file
-  return await storage.getUserKey(userId);
 }
 
 // ─── BOT HANDLERS ─────────────────────────────────────────────────────────────
@@ -822,305 +475,137 @@ bot.command("key", async (ctx) => {
     `📦 Gói: <b>${PACKAGES[key.pkg]?.label || key.pkg}</b>\n` +
     `⏳ Hết hạn: <b>${formatExpire(key.expire)}</b>\n` +
     `⏰ Còn lại: <b>${timeRemaining(key)}</b>`,
-    Markup.inlineKeyboard([
-      [Markup.button.callback("🎲 DỰ ĐOÁN TỰ ĐỘNG", "predict_auto")],
-      [Markup.button.callback("🔍 Dự đoán MD5", "predict_md5")],
-    ])
+    Markup.inlineKeyboard([[Markup.button.callback("🎲 DỰ ĐOÁN TỰ ĐỘNG", "predict_auto")]])
   );
 });
 
-// ── DỰ ĐOÁN TỰ ĐỘNG (cập nhật mỗi 20s) ──────────────────────────────────────
 bot.action("predict_auto", async (ctx) => {
   const userId = ctx.from.id;
-  const key = await getKeyForUser(userId);
+  const key = await storage.getUserKey(userId);
   if (!key || !isKeyValid(key)) {
-    const expired = key && !isKeyValid(key);
-    await ctx.answerCbQuery("⛔ " + (expired ? "Key đã hết hạn!" : "Chưa có key!"), { show_alert: true });
-    return ctx.replyWithHTML(
-      expired
-        ? `⛔ <b>Key của bạn đã hết hạn!</b>\nVui lòng mua key mới và dùng <code>/key SXD-XXXX</code> để kích hoạt.`
-        : `❌ Bạn chưa có key.\nDùng <code>/key SXD-XXXX</code> để kích hoạt.`,
-      Markup.inlineKeyboard([[Markup.button.callback("💳 Mua Key", "buy_key")]])
-    );
+    await ctx.answerCbQuery("⛔ Bạn chưa có key hợp lệ!", { show_alert: true });
+    return ctx.replyWithHTML(`❌ Bạn chưa có key.\nDùng <code>/key SXD-XXXX</code> để kích hoạt.`, Markup.inlineKeyboard([[Markup.button.callback("💳 Mua Key", "buy_key")]]));
   }
-
   await ctx.answerCbQuery("🔎 Đang khởi động dự đoán tự động...");
-
-  // Gửi tin nhắn chờ, lấy messageId để edit sau
-  const sentMsg = await ctx.reply("⏳ <b>Đang tải dữ liệu API...</b>\n🔄 Tự động cập nhật mỗi 20 giây.", { parse_mode: "HTML" });
-  const chatId = sentMsg.chat.id;
-  const messageId = sentMsg.message_id;
-
-  startAutoPredict(userId, chatId, messageId, ctx);
+  const sentMsg = await ctx.reply("⏳ <b>Đang tải dữ liệu API...</b>", { parse_mode: "HTML" });
+  startAutoPredict(userId, sentMsg.chat.id, sentMsg.message_id, ctx);
 });
 
-// ── DỪNG TỰ ĐỘNG ──────────────────────────────────────────────────────────────
 bot.action(/^stop_auto_(\d+)$/, async (ctx) => {
   const userId = parseInt(ctx.match[1]);
-  if (ctx.from.id !== userId) return ctx.answerCbQuery("❌ Không phải của bạn!", { show_alert: true });
+  if (ctx.from.id !== userId) return;
   stopAutoPredict(userId, ctx.chat.id);
-  await ctx.answerCbQuery("✅ Đã dừng dự đoán tự động.");
-  ctx.editMessageText(
-    "⏹ <b>Đã dừng dự đoán tự động.</b>\n\nChọn bên dưới để tiếp tục:",
-    {
-      parse_mode: "HTML",
-      ...Markup.inlineKeyboard([
-        [Markup.button.callback("🎲 Bắt đầu lại", "predict_auto")],
-        [Markup.button.callback("🏠 Menu chính", "main_menu")],
-      ]),
-    }
+  await ctx.answerCbQuery("✅ Đã dừng.");
+  ctx.editMessageText("⏹ <b>Đã dừng dự đoán tự động.</b>", { parse_mode: "HTML", ...Markup.inlineKeyboard([[Markup.button.callback("🏠 Menu chính", "main_menu")]]) });
+});
+
+bot.action("predict_md5", async (ctx) => {
+  await ctx.answerCbQuery();
+  ctx.replyWithHTML(
+    `🔍 <b>DỰ ĐOÁN THEO MÃ MD5 CHỈ ĐỊNH</b>\n\n` +
+    `Vui lòng copy mã MD5 ở phiên hiện tại và dùng lệnh sau để phân tích nhanh:\n` +
+    `👉 <code>/md5 [mã_md5]</code>\n\n` +
+    `<i>Ví dụ:</i>\n<code>/md5 e10adc3949ba59abbe56e057f20f883e</code>`
   );
 });
 
-// ── DỰ ĐOÁN MD5 ──────────────────────────────────────────────────────────────
-bot.action("predict_md5", async (ctx) => {
+// Lệnh md5 cho phép nhập mã tự do
+bot.command("md5", async (ctx) => {
   const userId = ctx.from.id;
-  const key = await getKeyForUser(userId);
-  if (!key || !isKeyValid(key)) {
-    const expired = key && !isKeyValid(key);
-    await ctx.answerCbQuery("⛔ " + (expired ? "Key đã hết hạn!" : "Chưa có key!"), { show_alert: true });
-    return ctx.replyWithHTML(
-      expired
-        ? `⛔ <b>Key của bạn đã hết hạn!</b>`
-        : `❌ Bạn chưa có key.\nDùng <code>/key SXD-XXXX</code> để kích hoạt.`,
-      Markup.inlineKeyboard([[Markup.button.callback("💳 Mua Key", "buy_key")]])
-    );
-  }
+  const key = await storage.getUserKey(userId);
+  if (!key || !isKeyValid(key)) return ctx.reply("❌ Bạn chưa có key hoặc key hết hạn!");
 
-  await ctx.answerCbQuery("🔬 Đang phân tích MD5...");
+  const hash = ctx.message.text.trim().split(/\s+/)[1];
+  if (!hash || hash.length < 32) return ctx.reply("❌ Lỗi: Bạn cần cung cấp mã MD5 hợp lệ.\nVí dụ: /md5 abcdef...");
 
+  await ctx.reply("🔬 Đang truy vấn toàn bộ API để phân tích MD5 này...");
   try {
-    const resp = await axios.get(API_MD5_URL, {
-      timeout: 12000,
-      headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" },
-    });
+    const resp = await axios.get(API_MD5_URL, { timeout: 15000 });
     const list = extractListFromResponse(resp.data);
-    if (list.length === 0) return ctx.reply("❌ Không lấy được dữ liệu API.");
-
-    const sessions = list
-      .map(normalizeSession)
-      .filter(Boolean)
-      .sort((a, b) => b.id_num - a.id_num);
-    if (sessions.length === 0) return ctx.reply("❌ Không parse được phiên.");
-
-    const latest = sessions[0];
+    const sessions = list.map(normalizeSession).filter(Boolean).sort((a, b) => b.id_num - a.id_num);
     const md5Map = buildMd5SequenceMap(sessions);
-    const md5Pred = predictFromMd5(latest.md5, md5Map);
+    
+    const md5Pred = predictFromMd5(hash, md5Map);
+    
+    // Căn cứ xúc xắc tổng
+    const recentDice = sessions.slice(0, 10).filter(s => s.dice.length >= 3);
+    const avgSum = recentDice.length > 0 ? recentDice.reduce((acc, s) => acc + s.diceSum, 0) / recentDice.length : 10.5;
+    const diceBaseStr = avgSum <= 10 ? "XỈU (3-10)" : "TÀI (11-18)";
 
-    // Phân tích thêm: phân phối tổng xúc xắc trong lịch sử
-    const diceStats = sessions.filter(s => s.dice.length >= 3);
-    const sumDist = Array(19).fill(0);
-    diceStats.forEach(s => { if (s.diceSum >= 3 && s.diceSum <= 18) sumDist[s.diceSum]++; });
+    if (!md5Pred) return ctx.reply(`⚠️ Mã MD5 này chưa có đủ dữ liệu lịch sử để dự đoán chắc chắn. Tổng xúc xắc hiện tại nghiêng về: ${diceBaseStr}.`);
 
-    // Top 3 tổng điểm hay xuất hiện nhất
-    const topSums = sumDist
-      .map((cnt, sum) => ({ sum, cnt }))
-      .filter(x => x.sum >= 3)
-      .sort((a, b) => b.cnt - a.cnt)
-      .slice(0, 3)
-      .map(x => `${x.sum}(${x.cnt}lần)`)
-      .join(", ");
-
-    const taiHistCount = diceStats.filter(s => s.result === "TAI").length;
-    const xiuHistCount = diceStats.length - taiHistCount;
-
-    let predText = "⚠️ Không đủ mẫu để dự đoán";
-    if (md5Pred) {
-      predText = `${md5Pred.pred === "TAI" ? "TÀI 🔴" : "XỈU ⚪"} — Độ tin: <b>${md5Pred.conf}%</b> (${md5Pred.samples} mẫu gần giống)`;
-    }
-
-    const md5HashDisplay = latest.md5
-      ? `<code>${latest.md5.slice(0, 16)}...${latest.md5.slice(-8)}</code>`
-      : "Không có";
-
-    await ctx.replyWithHTML(
-      `🔬 <b>PHÂN TÍCH MD5 – TOÀN BỘ LỊCH SỬ</b>\n\n` +
-      `📌 Phiên gần nhất: <b>#${latest.id}</b>\n` +
-      `🎲 Xúc xắc: ${buildDiceDisplay(latest.dice, latest.diceSum)}\n` +
-      `🏆 Kết quả: <b>${latest.result === "TAI" ? "TÀI 🔴" : "XỈU ⚪"}</b>\n` +
-      `🔑 MD5: ${md5HashDisplay}\n` +
-      `━━━━━━━━━━━━━━━━━━━━\n` +
-      `🔮 <b>Dự đoán phiên #${latest.id_num + 1}:</b>\n` +
-      `${predText}\n` +
-      `━━━━━━━━━━━━━━━━━━━━\n` +
-      `📊 Lịch sử (${diceStats.length} phiên):\n` +
-      `  🔴 TÀI: ${taiHistCount} lần (${diceStats.length ? ((taiHistCount / diceStats.length) * 100).toFixed(0) : 0}%)\n` +
-      `  ⚪ XỈU: ${xiuHistCount} lần (${diceStats.length ? ((xiuHistCount / diceStats.length) * 100).toFixed(0) : 0}%)\n` +
-      `🎲 Tổng hay xuất hiện: ${topSums || "—"}\n` +
-      `🔬 Tổng mẫu MD5 đã phân tích: <b>${md5Map.length}</b>\n` +
-      `━━━━━━━━━━━━━━━━━━━━\n` +
-      `⏰ Key còn: <b>${timeRemaining(key)}</b>`,
-      Markup.inlineKeyboard([
-        [Markup.button.callback("🔄 Cập nhật MD5", "predict_md5")],
-        [Markup.button.callback("🎲 DỰ ĐOÁN TỰ ĐỘNG", "predict_auto")],
-        [Markup.button.callback("🏠 Menu chính", "main_menu")],
-      ])
+    const predStr = md5Pred.pred === "TAI" ? "TÀI 🔴" : "XỈU ⚪";
+    ctx.replyWithHTML(
+      `🔬 <b>KẾT QUẢ DỰ ĐOÁN MD5</b>\n\n` +
+      `🔑 Mã Hash: <code>${hash.slice(0, 16)}...</code>\n` +
+      `🎯 Dự đoán: <b>${predStr}</b>\n` +
+      `📈 Độ tin cậy: <b>${md5Pred.conf}%</b> (${md5Pred.samples} mẫu trùng khớp)\n\n` +
+      `🎲 Cơ sở xúc xắc (10 phiên): Trung bình ${avgSum.toFixed(1)} điểm, áp dụng quy tắc <b>${diceBaseStr}</b>.\n` +
+      `💪 Theo/Bẻ cầu: <b>${md5Pred.conf >= 70 ? "MẠNH MẼ THEO CẦU" : "CÂN NHẮC BẺ CẦU"}</b>`
     );
-  } catch (e) {
-    console.error("MD5 Predict Error:", e.message);
-    ctx.reply("❌ Lỗi kết nối API: " + e.message);
-  }
+  } catch (e) { ctx.reply("❌ Lỗi kết nối API lấy dữ liệu MD5."); }
 });
 
 bot.action("main_menu", async (ctx) => {
   try { await ctx.answerCbQuery(); } catch {}
-  ctx.editMessageText(
-    "🏠 <b>Menu Chính – S2KING_BOT</b>",
-    {
-      parse_mode: "HTML",
-      ...Markup.inlineKeyboard([
-        [Markup.button.callback("🎲 DỰ ĐOÁN TỰ ĐỘNG", "predict_auto")],
-        [Markup.button.callback("🔍 Dự đoán MD5", "predict_md5")],
-        [Markup.button.callback("👤 Tài khoản", "my_account"), Markup.button.callback("💳 Mua Key", "buy_key")],
-      ]),
-    }
-  );
+  ctx.editMessageText("🏠 <b>Menu Chính – S2KING_BOT</b>", {
+    parse_mode: "HTML",
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback("🎲 DỰ ĐOÁN TỰ ĐỘNG", "predict_auto")],
+      [Markup.button.callback("🔍 Dự đoán MD5", "predict_md5")],
+      [Markup.button.callback("👤 Tài khoản", "my_account"), Markup.button.callback("💳 Mua Key", "buy_key")],
+    ]),
+  });
 });
 
 bot.action("my_account", async (ctx) => {
   try { await ctx.answerCbQuery(); } catch {}
-  const key = await getKeyForUser(ctx.from.id);
+  const key = await storage.getUserKey(ctx.from.id);
   const st = getStats(ctx.from.id);
   const total = st.win + st.loss;
   const winRate = total > 0 ? ((st.win / total) * 100).toFixed(0) : "—";
 
-  if (!key) {
-    return ctx.replyWithHTML(
-      `👤 <b>Tài khoản của bạn</b>\n\nID: <code>${ctx.from.id}</code>\n❌ Chưa có key.\n\nDùng <code>/key SXD-XXXX</code> để kích hoạt.`
-    );
-  }
-  const valid = isKeyValid(key);
+  if (!key) return ctx.replyWithHTML(`👤 <b>Tài khoản của bạn</b>\n\nID: <code>${ctx.from.id}</code>\n❌ Chưa có key.`);
   ctx.replyWithHTML(
     `👤 <b>Thông tin tài khoản</b>\n\n` +
-    `🆔 ID: <code>${ctx.from.id}</code>\n` +
     `🔑 Key: <code>${key.key_text}</code>\n` +
     `📦 Gói: <b>${PACKAGES[key.pkg]?.label || key.pkg}</b>\n` +
-    `⏰ Hết hạn: <b>${formatExpire(key.expire)}</b>\n` +
-    `⏳ Còn lại: <b>${timeRemaining(key)}</b>\n` +
-    `🔘 Trạng thái: ${valid ? "✅ Đang hoạt động" : "❌ Hết hạn"}\n\n` +
-    `📈 <b>Thống kê:</b>\n` +
-    `  🏆 Thắng: <b>${st.win}</b>  |  ❌ Thua: <b>${st.loss}</b>  |  Tỉ lệ: <b>${winRate}%</b>`
+    `⏳ Còn lại: <b>${timeRemaining(key)}</b>\n\n` +
+    `📈 Thống kê:\n🏆 Thắng: <b>${st.win}</b> | ❌ Thua: <b>${st.loss}</b> | Tỉ lệ: <b>${winRate}%</b>`
   );
 });
 
 bot.action("buy_key", async (ctx) => {
   try { await ctx.answerCbQuery(); } catch {}
-  ctx.replyWithHTML(
-    `💳 <b>Bảng Giá Key S2KING_BOT</b>\n\n` +
-    `⚡ 5 Giờ — Liên hệ admin\n` +
-    `📅 1 Ngày — Liên hệ admin\n` +
-    `🗓️ 1 Tuần — Liên hệ admin\n` +
-    `💎 1 Tháng — Liên hệ admin\n` +
-    `♾️ Vĩnh Viễn — Liên hệ admin\n\n` +
-    `📩 Liên hệ <a href="https://t.me/cskh09099">@cskh09099</a> để mua key.`,
-    { parse_mode: "HTML", disable_web_page_preview: true }
-  );
+  ctx.replyWithHTML(`💳 <b>Liên hệ <a href="https://t.me/cskh09099">@cskh09099</a> để mua key.</b>`, { disable_web_page_preview: true });
 });
 
-// ─── ADMIN COMMANDS ──────────────────────────────────────────────────────────
 bot.command("taokey", async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return;
   const parts = ctx.message.text.trim().split(/\s+/);
   const uid = parts[1];
   const pkg = parts[2];
-  if (!uid || !pkg || !PACKAGES[pkg]) {
-    return ctx.reply(
-      "Cách dùng: /taokey <user_id|none> <pkg>\n" +
-      "Gói: 5h, 1ngay, 1tuan, 1thang, vinhvien\n" +
-      "Ví dụ: /taokey none 1ngay\n" +
-      "       /taokey 123456789 1tuan"
-    );
-  }
+  if (!uid || !pkg || !PACKAGES[pkg]) return ctx.reply("Cách dùng: /taokey <user_id|none> <pkg>\nGói: 5h, 1ngay, 1tuan, 1thang, vinhvien");
 
   const keyText = "SXD-" + crypto.randomBytes(8).toString("hex").toUpperCase();
   const isNone = uid === "none";
-  let expire, user_id, activatedNote;
-
-  if (isNone) {
-    // Key chưa gắn user → thời gian BẮT ĐẦU khi user /key kích hoạt
-    user_id = null;
-    expire = "pending_activation";
-    activatedNote = "Bắt đầu đếm khi user kích hoạt";
-  } else {
-    // FIX: Tạo key trực tiếp cho user → đếm giờ từ LÚC TẠO (giờ thực)
-    user_id = uid;
-    const hours = PACKAGES[pkg].hours;
-    expire = hours ? new Date(Date.now() + hours * 3600 * 1000).toISOString() : "never";
-    activatedNote = `Bắt đầu ngay: ${formatExpire(expire)}`;
-  }
+  let expire = isNone ? "pending_activation" : (PACKAGES[pkg].hours ? new Date(Date.now() + PACKAGES[pkg].hours * 3600000).toISOString() : "never");
 
   await storage.setKey(keyText, {
-    user_id,
+    user_id: isNone ? null : uid,
     pkg,
     expire,
     created: new Date().toISOString(),
     activated: isNone ? null : new Date().toISOString(),
   });
 
-  ctx.replyWithHTML(
-    `✅ <b>Tạo Key thành công</b>\n\n` +
-    `🔑 Key: <code>${keyText}</code>\n` +
-    `📦 Gói: <b>${PACKAGES[pkg].label}</b>\n` +
-    `👤 User: <b>${isNone ? "Chưa gắn (user tự kích hoạt bằng /key)" : uid}</b>\n` +
-    `⏰ Hết hạn: <b>${activatedNote}</b>`
-  );
+  ctx.replyWithHTML(`✅ <b>Tạo Key thành công</b>\n🔑 Key: <code>${keyText}</code>\n👤 User: <b>${isNone ? "Chưa gắn" : uid}</b>`);
 });
 
-bot.command("listkeys", async (ctx) => {
-  if (ctx.from.id !== ADMIN_ID) return;
-  const keys = await storage.loadAll();
-  const entries = Object.entries(keys);
-  if (entries.length === 0) return ctx.reply("Chưa có key nào.");
-  const lines = entries.slice(-20).map(([k, v]) => {
-    const valid = isKeyValid({ ...v, key_text: k });
-    const remain = timeRemaining({ ...v, key_text: k });
-    return `${valid ? "✅" : "❌"} <code>${k}</code> | ${v.pkg} | ${v.user_id || "chưa kích hoạt"} | ${remain}`;
-  });
-  ctx.replyWithHTML(`📋 <b>Danh sách Key (${entries.length} keys):</b>\n\n` + lines.join("\n"));
-});
-
-bot.command("deletekey", async (ctx) => {
-  if (ctx.from.id !== ADMIN_ID) return;
-  const keyText = ctx.message.text.trim().split(/\s+/)[1];
-  if (!keyText) return ctx.reply("Cách dùng: /deletekey SXD-XXXX");
-  const key = await storage.getKey(keyText);
-  if (!key) return ctx.reply("❌ Không tìm thấy key.");
-  await storage.deleteKey(keyText);
-  ctx.reply(`✅ Đã xoá key: ${keyText}`);
-});
-
-bot.command("resetstats", (ctx) => {
-  const userId = ctx.from.id;
-  userStats[userId] = { win: 0, loss: 0, lastPrediction: null, lastSessionId: null };
-  ctx.reply("✅ Đã reset thống kê thắng/thua của bạn.");
-});
-
-bot.command("debug", async (ctx) => {
-  if (ctx.from.id !== ADMIN_ID) return;
-  try {
-    const resp = await axios.get(API_URL, { timeout: 8000 });
-    const list = extractListFromResponse(resp.data);
-    const sessions = list.map(normalizeSession).filter(Boolean).sort((a, b) => b.id_num - a.id_num);
-    const sample3 = sessions.slice(0, 3).map(s =>
-      `#${s.id} → ${s.result} | dice:${s.dice.join(",")} | sum:${s.diceSum} | md5:${s.md5.slice(0, 12)}…`
-    ).join("\n");
-    ctx.reply(
-      `📦 API OK – ${list.length} items, ${sessions.length} phiên parse được\n\n` +
-      `3 phiên gần nhất:\n${sample3}`
-    );
-  } catch (e) {
-    ctx.reply("❌ Lỗi: " + e.message);
-  }
-});
-
-// ─── KHỞI CHẠY ───────────────────────────────────────────────────────────────
 const app = express();
-app.get("/", (req, res) => res.send("✅ SXD AI Bot v7.0 đang chạy..."));
+app.get("/", (req, res) => res.send("✅ SXD AI Bot đang chạy..."));
 app.listen(process.env.PORT || 3000, () => console.log("Express server started"));
 
-storage.initDb().then(() => {
-  bot.launch().then(() => console.log("✅ Bot SXD AI v7.0 đã sẵn sàng!"));
-});
-
+storage.initDb().then(() => { bot.launch().then(() => console.log("✅ Bot SXD AI đã sẵn sàng!")); });
 process.once("SIGINT", () => bot.stop("SIGINT"));
 process.once("SIGTERM", () => bot.stop("SIGTERM"));

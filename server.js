@@ -23,47 +23,58 @@ class KeyStorage {
     this.useDb = !!(pool);
     this.dataDir = path.join(__dirname, "data");
     this.keyFile = path.join(this.dataDir, "keys.json");
-    this.memCache = {}; // Nguồn dữ liệu chính (Single Source of Truth)
+    this.memCache = {}; // Nguồn dữ liệu chính xác nhất
     
     try { if (!fs.existsSync(this.dataDir)) fs.mkdirSync(this.dataDir, { recursive: true }); } catch {}
-    
-    // Nạp file vào cache khi khởi động
-    if (!this.useDb && fs.existsSync(this.keyFile)) {
-      try {
-        const fileData = JSON.parse(fs.readFileSync(this.keyFile, "utf-8"));
-        this.memCache = fileData;
-      } catch (e) { console.error("Lỗi đọc keys.json", e); }
-    }
   }
 
   async initDb() {
-    if (!this.useDb) return;
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS keys (
-        key_text TEXT PRIMARY KEY,
-        user_id TEXT,
-        pkg TEXT,
-        expire TEXT,
-        created TEXT,
-        activated TEXT
-      )
-    `).catch(() => {});
-    
-    try {
-      const res = await pool.query("SELECT * FROM keys");
-      this.memCache = Object.fromEntries(res.rows.map(r => [r.key_text, r]));
-    } catch {}
+    if (this.useDb) {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS keys (
+          key_text TEXT PRIMARY KEY,
+          user_id TEXT,
+          pkg TEXT,
+          expire TEXT,
+          created TEXT,
+          activated TEXT
+        )
+      `).catch(() => {});
+    }
+    await this.loadAll(); // Nạp dữ liệu vào cache khi khởi động
   }
 
-  // Luôn ghi đè file bằng memCache để tránh mất dữ liệu
-  async syncToFile() {
-    if (this.useDb) return;
+  async loadAll() {
+    let fileData = {};
+    try {
+      if (fs.existsSync(this.keyFile)) {
+        fileData = JSON.parse(fs.readFileSync(this.keyFile, "utf-8"));
+      }
+    } catch {}
+
+    // Ưu tiên nạp từ file hệ thống vào cache
+    this.memCache = { ...this.memCache, ...fileData };
+
+    if (this.useDb) {
+      try {
+        const res = await pool.query("SELECT * FROM keys");
+        const dbData = Object.fromEntries(res.rows.map(r => [r.key_text, r]));
+        // SỬA LỖI: memCache đè lên dbData để bảo toàn key mới tạo chưa kịp lưu DB
+        this.memCache = { ...dbData, ...this.memCache };
+      } catch (e) { console.error("DB Load Error:", e.message); }
+    }
+    return this.memCache;
+  }
+
+  async saveAll(keys) {
+    this.memCache = { ...keys };
+    // Bắt buộc backup ra file để chống mất dữ liệu khi DB sập
     try { fs.writeFileSync(this.keyFile, JSON.stringify(this.memCache, null, 2)); } catch {}
   }
 
   async setKey(keyText, data) {
     this.memCache[keyText] = data;
-    this.syncToFile();
+    await this.saveAll(this.memCache); // Lưu file ngay lập tức
     
     if (this.useDb) {
       try {
@@ -80,15 +91,18 @@ class KeyStorage {
   }
 
   async getUserKey(userId) {
+    await this.loadAll(); // Đảm bảo cache luôn mới nhất
     const entry = Object.entries(this.memCache).find(([_, v]) => String(v.user_id) === String(userId));
     return entry ? { key_text: entry[0], ...entry[1] } : null;
   }
 
   async getKey(keyText) {
+    await this.loadAll();
     return this.memCache[keyText] ? { key_text: keyText, ...this.memCache[keyText] } : null;
   }
 
   async activateKey(keyText, userId) {
+    await this.loadAll();
     let k = this.memCache[keyText];
     if (!k) return { ok: false, msg: "❌ Key không tồn tại!" };
     if (k.user_id && String(k.user_id) !== String(userId))
@@ -114,13 +128,13 @@ class KeyStorage {
     }
 
     this.memCache[keyText] = k;
-    this.syncToFile();
+    await this.saveAll(this.memCache);
     return { ok: true, key: { key_text: keyText, ...k } };
   }
 
   async deleteKey(keyText) {
     delete this.memCache[keyText];
-    this.syncToFile();
+    await this.saveAll(this.memCache);
     if (this.useDb) {
       try { await pool.query(`DELETE FROM keys WHERE key_text=$1`, [keyText]); } catch {}
     }
@@ -179,6 +193,15 @@ function formatExpire(exp) {
   return new Date(exp).toLocaleString("vi-VN", { timeZone: "Asia/Ho_Chi_Minh" });
 }
 
+// ─── HELPER: Lấy Key nhanh ────────────────────────────────────────────────────
+async function getKeyForUser(userId) {
+  if (storage.memCache) {
+    const entry = Object.entries(storage.memCache).find(([_, v]) => String(v.user_id) === String(userId));
+    if (entry) return { key_text: entry[0], ...entry[1] };
+  }
+  return await storage.getUserKey(userId);
+}
+
 // ─── API DATA PARSER ─────────────────────────────────────────────────────────
 function extractListFromResponse(data) {
   if (Array.isArray(data)) return data;
@@ -211,7 +234,7 @@ function resultFromDice(dice) {
   if (!dice || dice.length < 3) return null;
   const sum = dice[0] + dice[1] + dice[2];
   if (sum < 3 || sum > 18) return null;
-  return sum >= 11 ? "TAI" : "XIU"; // Đảm bảo: 11-18 = Tài, 3-10 = Xỉu
+  return sum >= 11 ? "TAI" : "XIU"; // Chuẩn hóa: 11-18 = Tài, 3-10 = Xỉu
 }
 
 function resultFromField(s) {
@@ -294,20 +317,16 @@ function analyzeSmart(sessions) {
   const results = sessions.map(s => s.result);
   const n = results.length;
   
-  // Phân tích bệt
   let streak = 1;
   const last = results[0];
   for (let i = 1; i < n; i++) { if (results[i] === last) streak++; else break; }
 
-  // Cầu 1-1
   let pingpongLen = 0;
   for (let i = 0; i < n - 1; i++) { if (results[i] !== results[i + 1]) pingpongLen++; else break; }
 
-  // MD5 analysis
   const md5Map = buildMd5SequenceMap(sessions);
   const md5Pred = predictFromMd5(sessions[0].md5, md5Map);
 
-  // Phân tích tổng xúc xắc: 3-10 (Xỉu), 11-18 (Tài)
   const recentDice = sessions.slice(0, Math.min(10, n)).filter(s => s.dice.length >= 3);
   const avgSum = recentDice.length > 0 ? recentDice.reduce((acc, s) => acc + s.diceSum, 0) / recentDice.length : 10.5;
   const diceTrendStr = avgSum <= 10 ? "XỈU (3-10 điểm)" : "TÀI (11-18 điểm)";
@@ -377,10 +396,10 @@ function buildPredictMessage(sessions, key, stats) {
   );
 }
 
-// ─── AUTO PREDICT CẬP NHẬT TỨC THÌ ───────────────────────────────────────────
+// ─── AUTO PREDICT ─────────────────────────────────────────────────────────────
 async function fetchAndPredict(userId, chatId, messageId, ctx) {
   try {
-    const keyObj = await storage.getUserKey(userId);
+    const keyObj = await getKeyForUser(userId);
     if (!keyObj || !isKeyValid(keyObj)) {
       stopAutoPredict(userId, chatId);
       try {
@@ -400,7 +419,6 @@ async function fetchAndPredict(userId, chatId, messageId, ctx) {
     const latest = sessions[0];
     const st = getStats(userId);
 
-    // Cập nhật khi phiên mới xuất hiện
     if (st.lastSessionId && st.lastSessionId !== String(latest.id_num)) {
       if (st.lastPrediction === latest.result) st.win++;
       else st.loss++;
@@ -426,7 +444,7 @@ async function fetchAndPredict(userId, chatId, messageId, ctx) {
 
 function startAutoPredict(userId, chatId, messageId, ctx) {
   stopAutoPredict(userId, chatId);
-  // Quét 15 giây 1 lần để nhạy với phiên mới nhất
+  // Cập nhật mỗi 15s để bắt phiên cực nhanh
   const intervalId = setInterval(() => fetchAndPredict(userId, chatId, messageId, ctx), 15000); 
   autoSessions[`${userId}_${chatId}`] = { intervalId, messageId };
   fetchAndPredict(userId, chatId, messageId, ctx);
@@ -475,13 +493,16 @@ bot.command("key", async (ctx) => {
     `📦 Gói: <b>${PACKAGES[key.pkg]?.label || key.pkg}</b>\n` +
     `⏳ Hết hạn: <b>${formatExpire(key.expire)}</b>\n` +
     `⏰ Còn lại: <b>${timeRemaining(key)}</b>`,
-    Markup.inlineKeyboard([[Markup.button.callback("🎲 DỰ ĐOÁN TỰ ĐỘNG", "predict_auto")]])
+    Markup.inlineKeyboard([
+      [Markup.button.callback("🎲 DỰ ĐOÁN TỰ ĐỘNG", "predict_auto")],
+      [Markup.button.callback("🔍 Dự đoán MD5", "predict_md5")],
+    ])
   );
 });
 
 bot.action("predict_auto", async (ctx) => {
   const userId = ctx.from.id;
-  const key = await storage.getUserKey(userId);
+  const key = await getKeyForUser(userId);
   if (!key || !isKeyValid(key)) {
     await ctx.answerCbQuery("⛔ Bạn chưa có key hợp lệ!", { show_alert: true });
     return ctx.replyWithHTML(`❌ Bạn chưa có key.\nDùng <code>/key SXD-XXXX</code> để kích hoạt.`, Markup.inlineKeyboard([[Markup.button.callback("💳 Mua Key", "buy_key")]]));
@@ -509,41 +530,61 @@ bot.action("predict_md5", async (ctx) => {
   );
 });
 
-// Lệnh md5 cho phép nhập mã tự do
 bot.command("md5", async (ctx) => {
   const userId = ctx.from.id;
-  const key = await storage.getUserKey(userId);
-  if (!key || !isKeyValid(key)) return ctx.reply("❌ Bạn chưa có key hoặc key hết hạn!");
+  const key = await getKeyForUser(userId);
+  
+  if (!key || !isKeyValid(key)) {
+    return ctx.replyWithHTML("❌ <b>Bạn chưa có key.</b>\nDùng <code>/key SXD-XXXX</code> để kích hoạt.");
+  }
 
-  const hash = ctx.message.text.trim().split(/\s+/)[1];
-  if (!hash || hash.length < 32) return ctx.reply("❌ Lỗi: Bạn cần cung cấp mã MD5 hợp lệ.\nVí dụ: /md5 abcdef...");
+  const parts = ctx.message.text.trim().split(/\s+/);
+  const targetMd5 = parts[1];
+  
+  if (!targetMd5 || targetMd5.length < 32) {
+    return ctx.reply("❌ Vui lòng nhập mã MD5 hợp lệ (32 ký tự).\nVí dụ: /md5 d33cf45200c3de98cb4635a3b8fb76bc");
+  }
 
-  await ctx.reply("🔬 Đang truy vấn toàn bộ API để phân tích MD5 này...");
+  const msg = await ctx.reply("🔬 Đang truy vấn toàn bộ API để phân tích MD5 này...");
+
   try {
     const resp = await axios.get(API_MD5_URL, { timeout: 15000 });
     const list = extractListFromResponse(resp.data);
+    
+    if (list.length === 0) {
+        return ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, undefined, "❌ Lỗi: Không lấy được dữ liệu API.");
+    }
+
     const sessions = list.map(normalizeSession).filter(Boolean).sort((a, b) => b.id_num - a.id_num);
     const md5Map = buildMd5SequenceMap(sessions);
-    
-    const md5Pred = predictFromMd5(hash, md5Map);
-    
-    // Căn cứ xúc xắc tổng
+    const md5Pred = predictFromMd5(targetMd5, md5Map);
+
     const recentDice = sessions.slice(0, 10).filter(s => s.dice.length >= 3);
     const avgSum = recentDice.length > 0 ? recentDice.reduce((acc, s) => acc + s.diceSum, 0) / recentDice.length : 10.5;
     const diceBaseStr = avgSum <= 10 ? "XỈU (3-10)" : "TÀI (11-18)";
 
-    if (!md5Pred) return ctx.reply(`⚠️ Mã MD5 này chưa có đủ dữ liệu lịch sử để dự đoán chắc chắn. Tổng xúc xắc hiện tại nghiêng về: ${diceBaseStr}.`);
+    if (!md5Pred) {
+      return ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, undefined,
+        `⚠️ Mã MD5 này chưa có đủ dữ liệu lịch sử để dự đoán chắc chắn. Tổng xúc xắc hiện tại nghiêng về: ${diceBaseStr}.`
+      );
+    }
 
-    const predStr = md5Pred.pred === "TAI" ? "TÀI 🔴" : "XỈU ⚪";
-    ctx.replyWithHTML(
-      `🔬 <b>KẾT QUẢ DỰ ĐOÁN MD5</b>\n\n` +
-      `🔑 Mã Hash: <code>${hash.slice(0, 16)}...</code>\n` +
-      `🎯 Dự đoán: <b>${predStr}</b>\n` +
-      `📈 Độ tin cậy: <b>${md5Pred.conf}%</b> (${md5Pred.samples} mẫu trùng khớp)\n\n` +
+    const predLabel = md5Pred.pred === "TAI" ? "TÀI 🔴" : "XỈU ⚪";
+    ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, undefined,
+      `🔬 <b>KẾT QUẢ PHÂN TÍCH MD5:</b>\n` +
+      `🔑 Mã: <code>${targetMd5.slice(0, 16)}...</code>\n\n` +
+      `🎯 Dự đoán: <b>${predLabel}</b>\n` +
+      `📈 Độ tin cậy: <b>${md5Pred.conf}%</b>\n` +
+      `📊 Dựa trên <b>${md5Pred.samples}</b> mẫu lịch sử.\n` +
       `🎲 Cơ sở xúc xắc (10 phiên): Trung bình ${avgSum.toFixed(1)} điểm, áp dụng quy tắc <b>${diceBaseStr}</b>.\n` +
-      `💪 Theo/Bẻ cầu: <b>${md5Pred.conf >= 70 ? "MẠNH MẼ THEO CẦU" : "CÂN NHẮC BẺ CẦU"}</b>`
+      `💪 Chiến thuật: <b>${md5Pred.conf >= 70 ? "MẠNH MẼ THEO CẦU" : "CÂN NHẮC BẺ CẦU"}</b>\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `⏰ Key còn: <b>${timeRemaining(key)}</b>`,
+      { parse_mode: "HTML" }
     );
-  } catch (e) { ctx.reply("❌ Lỗi kết nối API lấy dữ liệu MD5."); }
+  } catch (e) {
+    ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, undefined, "❌ Lỗi kết nối API lấy dữ liệu MD5.");
+  }
 });
 
 bot.action("main_menu", async (ctx) => {
@@ -560,7 +601,7 @@ bot.action("main_menu", async (ctx) => {
 
 bot.action("my_account", async (ctx) => {
   try { await ctx.answerCbQuery(); } catch {}
-  const key = await storage.getUserKey(ctx.from.id);
+  const key = await getKeyForUser(ctx.from.id);
   const st = getStats(ctx.from.id);
   const total = st.win + st.loss;
   const winRate = total > 0 ? ((st.win / total) * 100).toFixed(0) : "—";
@@ -600,6 +641,29 @@ bot.command("taokey", async (ctx) => {
   });
 
   ctx.replyWithHTML(`✅ <b>Tạo Key thành công</b>\n🔑 Key: <code>${keyText}</code>\n👤 User: <b>${isNone ? "Chưa gắn" : uid}</b>`);
+});
+
+bot.command("listkeys", async (ctx) => {
+  if (ctx.from.id !== ADMIN_ID) return;
+  const keys = await storage.loadAll();
+  const entries = Object.entries(keys);
+  if (entries.length === 0) return ctx.reply("Chưa có key nào.");
+  const lines = entries.slice(-20).map(([k, v]) => {
+    const valid = isKeyValid({ ...v, key_text: k });
+    const remain = timeRemaining({ ...v, key_text: k });
+    return `${valid ? "✅" : "❌"} <code>${k}</code> | ${v.pkg} | ${v.user_id || "chưa kích hoạt"} | ${remain}`;
+  });
+  ctx.replyWithHTML(`📋 <b>Danh sách Key (${entries.length} keys):</b>\n\n` + lines.join("\n"));
+});
+
+bot.command("deletekey", async (ctx) => {
+  if (ctx.from.id !== ADMIN_ID) return;
+  const keyText = ctx.message.text.trim().split(/\s+/)[1];
+  if (!keyText) return ctx.reply("Cách dùng: /deletekey SXD-XXXX");
+  const key = await storage.getKey(keyText);
+  if (!key) return ctx.reply("❌ Không tìm thấy key.");
+  await storage.deleteKey(keyText);
+  ctx.reply(`✅ Đã xoá key: ${keyText}`);
 });
 
 const app = express();

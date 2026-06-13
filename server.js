@@ -23,7 +23,15 @@ class KeyStorage {
     this.useDb = !!(pool);
     this.dataDir = path.join(__dirname, "data");
     this.keyFile = path.join(this.dataDir, "keys.json");
-    if (!fs.existsSync(this.dataDir)) fs.mkdirSync(this.dataDir, { recursive: true });
+    // In-memory cache – luon hoat dong du khong co DB hay file system bi reset
+    this.memCache = {};
+    try { if (!fs.existsSync(this.dataDir)) fs.mkdirSync(this.dataDir, { recursive: true }); } catch {}
+    // Nap file vao cache khi khoi dong (neu co)
+    try {
+      if (!this.useDb && fs.existsSync(this.keyFile)) {
+        this.memCache = JSON.parse(fs.readFileSync(this.keyFile, "utf-8"));
+      }
+    } catch {}
   }
 
   async initDb() {
@@ -38,33 +46,55 @@ class KeyStorage {
         activated TEXT
       )
     `).catch(() => {});
+    // Dong bo DB vao memCache khi khoi dong
+    try {
+      const res = await pool.query("SELECT * FROM keys");
+      this.memCache = Object.fromEntries(res.rows.map(r => [r.key_text, r]));
+    } catch {}
   }
 
   async loadAll() {
     if (this.useDb) {
-      const res = await pool.query("SELECT * FROM keys");
-      return Object.fromEntries(res.rows.map(r => [r.key_text, r]));
+      try {
+        const res = await pool.query("SELECT * FROM keys");
+        const dbData = Object.fromEntries(res.rows.map(r => [r.key_text, r]));
+        this.memCache = { ...this.memCache, ...dbData };
+      } catch {}
+    } else {
+      // Thu doc file, merge vao cache
+      try {
+        if (fs.existsSync(this.keyFile)) {
+          const fileData = JSON.parse(fs.readFileSync(this.keyFile, "utf-8"));
+          this.memCache = { ...fileData, ...this.memCache };
+        }
+      } catch {}
     }
-    try {
-      return fs.existsSync(this.keyFile) ? JSON.parse(fs.readFileSync(this.keyFile, "utf-8")) : {};
-    } catch { return {}; }
+    // Luon tra ve tu memCache (khong bao gio bi mat khi file reset)
+    return { ...this.memCache };
   }
 
   async saveAll(keys) {
+    // Luon luu vao memCache truoc
+    this.memCache = { ...keys };
     if (this.useDb) return;
-    fs.writeFileSync(this.keyFile, JSON.stringify(keys, null, 2));
+    // Co gang ghi file (khong crash neu that bai)
+    try { fs.writeFileSync(this.keyFile, JSON.stringify(keys, null, 2)); } catch {}
   }
 
   async setKey(keyText, data) {
+    // Luon luu vao memCache ngay lap tuc
+    this.memCache[keyText] = data;
     if (this.useDb) {
-      await pool.query(
-        `INSERT INTO keys (key_text, user_id, pkg, expire, created, activated)
-         VALUES ($1,$2,$3,$4,$5,$6)
-         ON CONFLICT (key_text)
-         DO UPDATE SET user_id=$2, pkg=$3, expire=$4, activated=$6`,
-        [keyText, data.user_id || null, data.pkg, data.expire,
-         data.created || new Date().toISOString(), data.activated || null]
-      );
+      try {
+        await pool.query(
+          `INSERT INTO keys (key_text, user_id, pkg, expire, created, activated)
+           VALUES ($1,$2,$3,$4,$5,$6)
+           ON CONFLICT (key_text)
+           DO UPDATE SET user_id=$2, pkg=$3, expire=$4, activated=$6`,
+          [keyText, data.user_id || null, data.pkg, data.expire,
+           data.created || new Date().toISOString(), data.activated || null]
+        );
+      } catch (e) { console.error("setKey DB error:", e.message); }
     } else {
       const keys = await this.loadAll();
       keys[keyText] = data;
@@ -924,13 +954,14 @@ bot.action("my_account", async (ctx) => {
 bot.action("buy_key", async (ctx) => {
   try { await ctx.answerCbQuery(); } catch {}
   ctx.replyWithHTML(
-    `💳 <b>Bảng Giá Key SXD AI</b>\n\n` +
+    `💳 <b>Bảng Giá Key S2KING_BOT</b>\n\n` +
     `⚡ 5 Giờ — Liên hệ admin\n` +
     `📅 1 Ngày — Liên hệ admin\n` +
     `🗓️ 1 Tuần — Liên hệ admin\n` +
     `💎 1 Tháng — Liên hệ admin\n` +
     `♾️ Vĩnh Viễn — Liên hệ admin\n\n` +
-    `📩 Liên hệ admin để mua key.`
+    `📩 Liên hệ <a href="https://t.me/cskh09099">@cskh09099</a> để mua key.`,
+    { parse_mode: "HTML", disable_web_page_preview: true }
   );
 });
 
